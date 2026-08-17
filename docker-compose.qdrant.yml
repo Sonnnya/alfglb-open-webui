@@ -2,7 +2,7 @@ name: openwebui
 
 services:
   openwebui:
-    image: ghcr.io/open-webui/open-webui:0.10.2 # TODO: 0.6.5
+    image: ghcr.io/open-webui/open-webui:0.10.2 # forked from 0.6.5, this was latest
     container_name: openwebui
     restart: always
     ports:
