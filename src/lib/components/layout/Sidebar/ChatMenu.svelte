@@ -1,17 +1,11 @@
 <script lang="ts">
-	import { DropdownMenu } from 'bits-ui';
-	import { flyAndScale } from '$lib/utils/transitions';
-	import { getContext, createEventDispatcher } from 'svelte';
+	import { getContext, tick } from 'svelte';
 
 	import fileSaver from 'file-saver';
 	const { saveAs } = fileSaver;
 
-	import jsPDF from 'jspdf';
-	import html2canvas from 'html2canvas-pro';
-
-	const dispatch = createEventDispatcher();
-
 	import Dropdown from '$lib/components/common/Dropdown.svelte';
+	import DropdownSub from '$lib/components/common/DropdownSub.svelte';
 	import GarbageBin from '$lib/components/icons/GarbageBin.svelte';
 	import Pencil from '$lib/components/icons/Pencil.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
@@ -26,14 +20,19 @@
 		getChatPinnedStatusById,
 		toggleChatPinnedStatusById
 	} from '$lib/apis/chats';
-	import { chats, theme } from '$lib/stores';
+	import { chats, folders, settings, theme, user } from '$lib/stores';
 	import { createMessagesList } from '$lib/utils';
+	import { getOutputText } from '$lib/components/chat/Messages/structuredOutput';
 	import { downloadChatAsPDF } from '$lib/apis/utils';
 	import Download from '$lib/components/icons/Download.svelte';
+	import Folder from '$lib/components/icons/Folder.svelte';
+	import Messages from '$lib/components/chat/Messages.svelte';
 
 	const i18n = getContext('i18n');
 
 	export let shareHandler: Function;
+	export let moveChatHandler: Function;
+
 	export let cloneChatHandler: Function;
 	export let archiveChatHandler: Function;
 	export let renameHandler: Function;
@@ -45,9 +44,14 @@
 	let show = false;
 	let pinned = false;
 
+	let chat = null;
+	let showFullMessages = false;
+
+	export let onPinChange: () => void = () => {};
+
 	const pinHandler = async () => {
 		await toggleChatPinnedStatusById(localStorage.token, chatId);
-		dispatch('change');
+		onPinChange();
 	};
 
 	const checkPinned = async () => {
@@ -58,7 +62,8 @@
 		const history = chat.chat.history;
 		const messages = createMessagesList(history, history.currentId);
 		const chatText = messages.reduce((a, message, i, arr) => {
-			return `${a}### ${message.role.toUpperCase()}\n${message.content}\n\n`;
+			const content = getOutputText(message.output) || message.content || '';
+			return `${a}### ${message.role.toUpperCase()}\n${content}\n\n`;
 		}, '');
 
 		return chatText.trim();
@@ -79,76 +84,168 @@
 	};
 
 	const downloadPdf = async () => {
-		const chat = await getChatById(localStorage.token, chatId);
+		chat = await getChatById(localStorage.token, chatId);
+		if (!chat) {
+			return;
+		}
 
-		const containerElement = document.getElementById('messages-container');
+		const [{ default: jsPDF }, { default: html2canvas }] = await Promise.all([
+			import('jspdf'),
+			import('html2canvas-pro')
+		]);
 
-		if (containerElement) {
-			try {
-				const isDarkMode = $theme.includes('dark'); // Check theme mode
+		if ($settings?.stylizedPdfExport ?? true) {
+			showFullMessages = true;
+			await tick();
 
-				// Define a fixed virtual screen size
-				const virtualWidth = 1024; // Fixed width (adjust as needed)
-				const virtualHeight = 1400; // Fixed height (adjust as needed)
+			const containerElement = document.getElementById('full-messages-container');
+			if (containerElement) {
+				try {
+					const isDarkMode = document.documentElement.classList.contains('dark');
+					const virtualWidth = 800; // px, fixed width for cloned element
 
-				// Clone the container to avoid layout shifts
-				const clonedElement = containerElement.cloneNode(true);
-				clonedElement.style.width = `${virtualWidth}px`; // Apply fixed width
-				clonedElement.style.height = 'auto'; // Allow content to expand
+					// Clone and style
+					const clonedElement = containerElement.cloneNode(true);
+					clonedElement.classList.add('text-black');
+					clonedElement.classList.add('dark:text-white');
+					clonedElement.style.width = `${virtualWidth}px`;
+					clonedElement.style.position = 'absolute';
+					clonedElement.style.left = '-9999px';
+					clonedElement.style.height = 'auto';
+					document.body.appendChild(clonedElement);
 
-				document.body.appendChild(clonedElement); // Temporarily add to DOM
+					// Override content-visibility so html2canvas can capture all messages
+					clonedElement.querySelectorAll('.message-listitem').forEach((el) => {
+						el.style.contentVisibility = 'visible';
+					});
 
-				// Render to canvas with predefined width
-				const canvas = await html2canvas(clonedElement, {
-					backgroundColor: isDarkMode ? '#000' : '#fff',
-					useCORS: true,
-					scale: 2, // Keep at 1x to avoid unexpected enlargements
-					width: virtualWidth, // Set fixed virtual screen width
-					windowWidth: virtualWidth, // Ensure consistent rendering
-					windowHeight: virtualHeight
-				});
+					// Let the browser compute layout for the cloned element
+					await new Promise((r) => requestAnimationFrame(r));
 
-				document.body.removeChild(clonedElement); // Clean up temp element
+					// Render entire content once
+					const canvas = await html2canvas(clonedElement, {
+						backgroundColor: isDarkMode ? '#000' : '#fff',
+						useCORS: true,
+						scale: 2, // increase resolution
+						width: virtualWidth
+					});
 
-				const imgData = canvas.toDataURL('image/png');
+					document.body.removeChild(clonedElement);
 
-				// A4 page settings
-				const pdf = new jsPDF('p', 'mm', 'a4');
-				const imgWidth = 210; // A4 width in mm
-				const pageHeight = 297; // A4 height in mm
+					const pdf = new jsPDF('p', 'mm', 'a4');
+					const pageWidthMM = 210;
+					const pageHeightMM = 297;
 
-				// Maintain aspect ratio
-				const imgHeight = (canvas.height * imgWidth) / canvas.width;
-				let heightLeft = imgHeight;
-				let position = 0;
+					// Convert page height in mm to px on canvas scale for cropping
+					// Get canvas DPI scale:
+					const pxPerMM = canvas.width / virtualWidth; // width in px / width in px?
+					// Since 1 page width is 210 mm, but canvas width is 800 px at scale 2
+					// Assume 1 mm = px / (pageWidthMM scaled)
+					// Actually better: Calculate scale factor from px/mm:
+					// virtualWidth px corresponds directly to 210mm in PDF, so pxPerMM:
+					const pxPerPDFMM = canvas.width / pageWidthMM; // canvas px per PDF mm
 
-				// Set page background for dark mode
-				if (isDarkMode) {
-					pdf.setFillColor(0, 0, 0);
-					pdf.rect(0, 0, imgWidth, pageHeight, 'F'); // Apply black bg
-				}
+					// Height in px for one page slice:
+					const pagePixelHeight = Math.floor(pxPerPDFMM * pageHeightMM);
 
-				pdf.addImage(imgData, 'PNG', 0, position, imgWidth, imgHeight);
-				heightLeft -= pageHeight;
+					let offsetY = 0;
+					let page = 0;
 
-				// Handle additional pages
-				while (heightLeft > 0) {
-					position -= pageHeight;
-					pdf.addPage();
+					while (offsetY < canvas.height) {
+						// Height of slice
+						const sliceHeight = Math.min(pagePixelHeight, canvas.height - offsetY);
 
-					if (isDarkMode) {
-						pdf.setFillColor(0, 0, 0);
-						pdf.rect(0, 0, imgWidth, pageHeight, 'F');
+						// Create temp canvas for slice
+						const pageCanvas = document.createElement('canvas');
+						pageCanvas.width = canvas.width;
+						pageCanvas.height = sliceHeight;
+
+						const ctx = pageCanvas.getContext('2d');
+
+						// Draw the slice of original canvas onto pageCanvas
+						ctx.drawImage(
+							canvas,
+							0,
+							offsetY,
+							canvas.width,
+							sliceHeight,
+							0,
+							0,
+							canvas.width,
+							sliceHeight
+						);
+
+						const imgData = pageCanvas.toDataURL('image/jpeg', 0.7);
+
+						// Calculate image height in PDF units keeping aspect ratio
+						const imgHeightMM = (sliceHeight * pageWidthMM) / canvas.width;
+
+						if (page > 0) pdf.addPage();
+
+						if (isDarkMode) {
+							pdf.setFillColor(0, 0, 0);
+							pdf.rect(0, 0, pageWidthMM, pageHeightMM, 'F'); // black bg
+						}
+
+						pdf.addImage(imgData, 'JPEG', 0, 0, pageWidthMM, imgHeightMM);
+
+						offsetY += sliceHeight;
+						page++;
 					}
 
-					pdf.addImage(imgData, 'PNG', 0, position, imgWidth, imgHeight);
-					heightLeft -= pageHeight;
-				}
+					pdf.save(`chat-${chat.chat.title}.pdf`);
 
-				pdf.save(`chat-${chat.chat.title}.pdf`);
-			} catch (error) {
-				console.error('Error generating PDF', error);
+					showFullMessages = false;
+				} catch (error) {
+					console.error('Error generating PDF', error);
+				}
 			}
+		} else {
+			console.log('Downloading PDF');
+
+			const chatText = await getChatAsText(chat);
+
+			const doc = new jsPDF();
+
+			// Margins
+			const left = 15;
+			const top = 20;
+			const right = 15;
+			const bottom = 20;
+
+			const pageWidth = doc.internal.pageSize.getWidth();
+			const pageHeight = doc.internal.pageSize.getHeight();
+			const usableWidth = pageWidth - left - right;
+			const usableHeight = pageHeight - top - bottom;
+
+			// Font size and line height
+			const fontSize = 8;
+			doc.setFontSize(fontSize);
+			const lineHeight = fontSize * 1; // adjust if needed
+
+			// Split the markdown into lines (handles \n)
+			const paragraphs = chatText.split('\n');
+
+			let y = top;
+
+			for (let paragraph of paragraphs) {
+				// Wrap each paragraph to fit the width
+				const lines = doc.splitTextToSize(paragraph, usableWidth);
+
+				for (let line of lines) {
+					// If the line would overflow the bottom, add a new page
+					if (y + lineHeight > pageHeight - bottom) {
+						doc.addPage();
+						y = top;
+					}
+					doc.text(line, left, y);
+					y += lineHeight * 0.5;
+				}
+				// Add empty line at paragraph breaks
+				y += lineHeight * 0.1;
+			}
+
+			doc.save(`chat-${chat.chat.title}.pdf`);
 		}
 	};
 
@@ -168,10 +265,31 @@
 	}
 </script>
 
+{#if chat && showFullMessages}
+	<div class="hidden w-full h-full flex-col">
+		<div id="full-messages-container">
+			<Messages
+				className="h-full flex pt-4 pb-8 w-full"
+				chatId={`chat-preview-${chat?.id ?? ''}`}
+				user={$user}
+				readOnly={true}
+				history={chat.chat.history}
+				messages={chat.chat.messages}
+				autoScroll={true}
+				sendMessage={() => {}}
+				continueResponse={() => {}}
+				regenerateResponse={() => {}}
+				messagesCount={null}
+				editCodeBlock={false}
+			/>
+		</div>
+	</div>
+{/if}
+
 <Dropdown
 	bind:show
-	on:change={(e) => {
-		if (e.detail === false) {
+	onOpenChange={(state) => {
+		if (state === false) {
 			onClose();
 		}
 	}}
@@ -181,145 +299,164 @@
 	</Tooltip>
 
 	<div slot="content">
-		<DropdownMenu.Content
-			class="w-full max-w-[200px] rounded-xl px-1 py-1.5 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg"
-			sideOffset={-2}
-			side="bottom"
-			align="start"
-			transition={flyAndScale}
+		<div
+			class="select-none min-w-[200px] rounded-2xl px-1 py-1 border border-gray-100 dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg transition"
 		>
-			<DropdownMenu.Item
-				class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-md"
-				on:click={() => {
-					pinHandler();
-				}}
-			>
-				{#if pinned}
-					<BookmarkSlash strokeWidth="2" />
-					<div class="flex items-center">{$i18n.t('Unpin')}</div>
-				{:else}
-					<Bookmark strokeWidth="2" />
-					<div class="flex items-center">{$i18n.t('Pin')}</div>
-				{/if}
-			</DropdownMenu.Item>
-
-			<DropdownMenu.Item
-				class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-md"
-				on:click={() => {
-					renameHandler();
-				}}
-			>
-				<Pencil strokeWidth="2" />
-				<div class="flex items-center">{$i18n.t('Rename')}</div>
-			</DropdownMenu.Item>
-
-			<DropdownMenu.Item
-				class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-md"
-				on:click={() => {
-					cloneChatHandler();
-				}}
-			>
-				<DocumentDuplicate strokeWidth="2" />
-				<div class="flex items-center">{$i18n.t('Clone')}</div>
-			</DropdownMenu.Item>
-
-			<DropdownMenu.Item
-				class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-md"
-				on:click={() => {
-					archiveChatHandler();
-				}}
-			>
-				<ArchiveBox strokeWidth="2" />
-				<div class="flex items-center">{$i18n.t('Archive')}</div>
-			</DropdownMenu.Item>
-
-			<DropdownMenu.Item
-				class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800  rounded-md"
-				on:click={() => {
-					shareHandler();
-				}}
-			>
-				<Share />
-				<div class="flex items-center">{$i18n.t('Share')}</div>
-			</DropdownMenu.Item>
-
-			<DropdownMenu.Sub>
-				<DropdownMenu.SubTrigger
-					class="flex gap-2 items-center px-3 py-2 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-md"
+			{#if $user?.role === 'admin' || ($user.permissions?.chat?.share ?? true)}
+				<button
+					draggable="false"
+					class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl w-full"
+					on:click={() => {
+						shareHandler();
+					}}
 				>
-					<Download strokeWidth="2" />
+					<Share strokeWidth="1.5" />
+					<div class="flex items-center">{$i18n.t('Share')}</div>
+				</button>
+			{/if}
 
-					<div class="flex items-center">{$i18n.t('Download')}</div>
-				</DropdownMenu.SubTrigger>
-				<DropdownMenu.SubContent
-					class="w-full rounded-xl px-1 py-1.5 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg"
-					transition={flyAndScale}
-					sideOffset={8}
+			{#if $user?.role === 'admin' || ($user.permissions?.chat?.export ?? true)}
+				<DropdownSub
+					contentClass="select-none rounded-2xl p-1 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg border border-gray-100 dark:border-gray-800"
 				>
-					<DropdownMenu.Item
-						class="flex gap-2 items-center px-3 py-2 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-md"
+					<button
+						slot="trigger"
+						draggable="false"
+						class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl w-full"
+					>
+						<Download strokeWidth="1.5" />
+						<div class="flex items-center">{$i18n.t('Download')}</div>
+					</button>
+
+					<button
+						draggable="false"
+						class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl w-full"
 						on:click={() => {
 							downloadJSONExport();
 						}}
 					>
 						<div class="flex items-center line-clamp-1">{$i18n.t('Export chat (.json)')}</div>
-					</DropdownMenu.Item>
-					<DropdownMenu.Item
-						class="flex gap-2 items-center px-3 py-2 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-md"
+					</button>
+
+					<button
+						draggable="false"
+						class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl w-full"
 						on:click={() => {
 							downloadTxt();
 						}}
 					>
 						<div class="flex items-center line-clamp-1">{$i18n.t('Plain text (.txt)')}</div>
-					</DropdownMenu.Item>
+					</button>
 
-					<DropdownMenu.Item
-						class="flex gap-2 items-center px-3 py-2 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-md"
+					<button
+						draggable="false"
+						class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl select-none w-full"
 						on:click={() => {
 							downloadPdf();
 						}}
 					>
 						<div class="flex items-center line-clamp-1">{$i18n.t('PDF document (.pdf)')}</div>
-					</DropdownMenu.Item>
-				</DropdownMenu.SubContent>
-			</DropdownMenu.Sub>
-			<DropdownMenu.Item
-				class="flex  gap-2  items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-md"
+					</button>
+				</DropdownSub>
+			{/if}
+
+			<button
+				draggable="false"
+				class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl w-full"
+				on:click={() => {
+					show = false;
+					renameHandler();
+				}}
+			>
+				<Pencil strokeWidth="1.5" />
+				<div class="flex items-center">{$i18n.t('Rename')}</div>
+			</button>
+
+			<hr class="border-gray-50/30 dark:border-gray-800/30 my-1" />
+
+			<button
+				draggable="false"
+				class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl w-full"
+				on:click={() => {
+					show = false;
+					pinHandler();
+				}}
+			>
+				{#if pinned}
+					<BookmarkSlash strokeWidth="1.5" />
+					<div class="flex items-center">{$i18n.t('Unpin')}</div>
+				{:else}
+					<Bookmark strokeWidth="1.5" />
+					<div class="flex items-center">{$i18n.t('Pin')}</div>
+				{/if}
+			</button>
+
+			{#if $user?.role === 'admin' || ($user?.permissions?.chat?.import ?? true)}
+				<button
+					draggable="false"
+					class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl w-full"
+					on:click={() => {
+						show = false;
+						cloneChatHandler();
+					}}
+				>
+					<DocumentDuplicate strokeWidth="1.5" />
+					<div class="flex items-center">{$i18n.t('Clone')}</div>
+				</button>
+			{/if}
+
+			{#if chatId && $folders.length > 0}
+				<DropdownSub
+					contentClass="select-none rounded-2xl p-1 z-50 bg-white dark:bg-gray-850 dark:text-white border border-gray-100 dark:border-gray-800 shadow-lg max-h-52 overflow-y-auto scrollbar-hidden"
+				>
+					<button
+						slot="trigger"
+						draggable="false"
+						class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl select-none w-full"
+					>
+						<Folder />
+						<div class="flex items-center">{$i18n.t('Move')}</div>
+					</button>
+
+					{#each $folders.sort((a, b) => b.updated_at - a.updated_at) as folder}
+						<button
+							draggable="false"
+							class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl overflow-hidden w-full"
+							on:click={() => {
+								moveChatHandler(chatId, folder.id);
+							}}
+						>
+							<div class="shrink-0">
+								<Folder />
+							</div>
+
+							<div class="truncate">{folder?.name ?? 'Folder'}</div>
+						</button>
+					{/each}
+				</DropdownSub>
+			{/if}
+
+			<button
+				draggable="false"
+				class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl w-full"
+				on:click={() => {
+					archiveChatHandler();
+				}}
+			>
+				<ArchiveBox strokeWidth="1.5" />
+				<div class="flex items-center">{$i18n.t('Archive')}</div>
+			</button>
+
+			<button
+				draggable="false"
+				class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl w-full"
 				on:click={() => {
 					deleteHandler();
 				}}
 			>
-				<GarbageBin strokeWidth="2" />
+				<GarbageBin strokeWidth="1.5" />
 				<div class="flex items-center">{$i18n.t('Delete')}</div>
-			</DropdownMenu.Item>
-
-			<hr class="border-gray-100 dark:border-gray-850 my-0.5" />
-
-			<div class="flex p-1">
-				<Tags
-					{chatId}
-					on:add={(e) => {
-						dispatch('tag', {
-							type: 'add',
-							name: e.detail.name
-						});
-
-						show = false;
-					}}
-					on:delete={(e) => {
-						dispatch('tag', {
-							type: 'delete',
-							name: e.detail.name
-						});
-
-						show = false;
-					}}
-					on:close={() => {
-						show = false;
-						onClose();
-					}}
-				/>
-			</div>
-		</DropdownMenu.Content>
+			</button>
+		</div>
 	</div>
 </Dropdown>

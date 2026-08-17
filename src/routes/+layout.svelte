@@ -1,23 +1,25 @@
 <script>
 	import { io } from 'socket.io-client';
 	import { spring } from 'svelte/motion';
-	import PyodideWorker from '$lib/workers/pyodide.worker?worker';
+	import { createPyodideWorker } from '$lib/pyodide/createPyodideWorker';
+	import { Toaster, toast } from 'svelte-sonner';
 
 	let loadingProgress = spring(0, {
 		stiffness: 0.05
 	});
 
-	import { onMount, tick, setContext } from 'svelte';
+	import { onMount, tick, setContext, onDestroy } from 'svelte';
 	import {
 		config,
 		user,
 		settings,
 		theme,
 		WEBUI_NAME,
+		WEBUI_VERSION,
+		WEBUI_DEPLOYMENT_ID,
 		mobile,
 		socket,
-		activeUserIds,
-		USAGE_POOL,
+		socketConnected,
 		chatId,
 		chats,
 		currentChatPage,
@@ -26,35 +28,100 @@
 		isLastActiveTab,
 		isApp,
 		appInfo,
-		toolServers
+		toolServers,
+		playingNotificationSound,
+		channels,
+		channelId,
+		terminalServers,
+		showControls,
+		showFileNavPath,
+		showFileNavDir,
+		pyodideWorker,
+		desktopEvent
 	} from '$lib/stores';
+	import { getFileContentById } from '$lib/apis/files';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
-	import { Toaster, toast } from 'svelte-sonner';
+	import { beforeNavigate } from '$app/navigation';
+	import { updated } from '$app/state';
 
-	import { executeToolServer, getBackendConfig } from '$lib/apis';
-	import { getSessionUser } from '$lib/apis/auths';
+	import i18n, { initI18n, getLanguages, changeLanguage } from '$lib/i18n';
 
 	import '../tailwind.css';
 	import '../app.css';
-
 	import 'tippy.js/dist/tippy.css';
 
-	import { WEBUI_BASE_URL, WEBUI_HOSTNAME } from '$lib/constants';
-	import i18n, { initI18n, getLanguages, changeLanguage } from '$lib/i18n';
-	import { bestMatchingLanguage } from '$lib/utils';
+	import { executeToolServer, getBackendConfig, getModels, getVersion } from '$lib/apis';
+	import { getSessionUser, updateUserTimezone, userSignOut } from '$lib/apis/auths';
 	import { getAllTags, getChatList } from '$lib/apis/chats';
+	import { chatCompletion } from '$lib/apis/openai';
+	import {
+		addOpenAIConnection,
+		removeOpenAIConnection,
+		addTerminalConnection,
+		removeTerminalConnection
+	} from '$lib/utils/connections';
+
+	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME } from '$lib/constants';
+	import {
+		bestMatchingLanguage,
+		cleanText,
+		displayFileHandler,
+		getUserTimezone,
+		removeAllDetails
+	} from '$lib/utils';
+	import { setTextScale } from '$lib/utils/text-scale';
+
 	import NotificationToast from '$lib/components/NotificationToast.svelte';
 	import AppSidebar from '$lib/components/app/AppSidebar.svelte';
-	import { chatCompletion } from '$lib/apis/openai';
+	import SyncStatsModal from '$lib/components/chat/Settings/SyncStatsModal.svelte';
+	import Spinner from '$lib/components/common/Spinner.svelte';
+	import { getOutputText } from '$lib/components/chat/Messages/structuredOutput';
+	import { getUserSettings } from '$lib/apis/users';
+	import dayjs from 'dayjs';
+	import { getChannels } from '$lib/apis/channels';
+
+	const unregisterServiceWorkers = async () => {
+		if ('serviceWorker' in navigator) {
+			try {
+				const registrations = await navigator.serviceWorker.getRegistrations();
+				await Promise.all(registrations.map((r) => r.unregister()));
+				return true;
+			} catch (error) {
+				console.error('Error unregistering service workers:', error);
+				return false;
+			}
+		}
+		return false;
+	};
+
+	// handle frontend updates (https://svelte.dev/docs/kit/configuration#version)
+	beforeNavigate(async ({ willUnload, to }) => {
+		if (updated.current && !willUnload && to?.url) {
+			await unregisterServiceWorkers();
+			location.href = to.url.href;
+		}
+	});
 
 	setContext('i18n', i18n);
 
 	const bc = new BroadcastChannel('active-tab-channel');
 
 	let loaded = false;
+	let tokenTimer = null;
+	let isAuthRedirectInProgress = false;
+
+	let showRefresh = false;
+
+	let showSyncStatsModal = false;
+	let syncStatsEventData = null;
+
+	let heartbeatInterval = null;
+	let disconnectToastTimer = null;
+	let disconnectWarningShown = false;
 
 	const BREAKPOINT = 768;
+	const DISCONNECT_TOAST_DELAY_MS = 2000;
 
 	const setupSocket = async (enableWebsocket) => {
 		const _socket = io(`${WEBUI_BASE_URL}` || undefined, {
@@ -66,15 +133,74 @@
 			transports: enableWebsocket ? ['websocket'] : ['polling', 'websocket'],
 			auth: { token: localStorage.token }
 		});
-
 		await socket.set(_socket);
 
 		_socket.on('connect_error', (err) => {
 			console.log('connect_error', err);
 		});
 
-		_socket.on('connect', () => {
+		let hasConnectedOnce = false;
+
+		_socket.on('connect', async () => {
 			console.log('connected', _socket.id);
+
+			// Cancel any pending disconnect toast if we reconnected quickly
+			if (disconnectToastTimer) {
+				clearTimeout(disconnectToastTimer);
+				disconnectToastTimer = null;
+			}
+
+			if (hasConnectedOnce) {
+				socketConnected.set(true);
+				// Only show "Reconnected" if the user actually saw the disconnect warning
+				if (disconnectWarningShown) {
+					toast.success($i18n.t('Reconnected'));
+					disconnectWarningShown = false;
+				}
+			}
+			hasConnectedOnce = true;
+
+			const res = await getVersion(localStorage.token);
+
+			const deploymentId = res?.deployment_id ?? null;
+			const version = res?.version ?? null;
+
+			if (version !== null || deploymentId !== null) {
+				if (
+					($WEBUI_VERSION !== null && version !== $WEBUI_VERSION) ||
+					($WEBUI_DEPLOYMENT_ID !== null && deploymentId !== $WEBUI_DEPLOYMENT_ID)
+				) {
+					await unregisterServiceWorkers();
+					location.href = location.href;
+					return;
+				}
+			}
+
+			// Send heartbeat every 30 seconds
+			heartbeatInterval = setInterval(() => {
+				if (_socket.connected) {
+					console.log('Sending heartbeat');
+					_socket.emit('heartbeat', {});
+				}
+			}, 30000);
+
+			if (deploymentId !== null) {
+				WEBUI_DEPLOYMENT_ID.set(deploymentId);
+			}
+
+			if (version !== null) {
+				WEBUI_VERSION.set(version);
+				window.WEBUI_VERSION = version;
+			}
+
+			console.log('version', version);
+
+			if (localStorage.getItem('token')) {
+				// Emit user-join event with auth token
+				_socket.emit('user-join', { auth: { token: localStorage.token } });
+			} else {
+				console.warn('No token found in localStorage, user-join event not emitted');
+			}
 		});
 
 		_socket.on('reconnect_attempt', (attempt) => {
@@ -87,56 +213,104 @@
 
 		_socket.on('disconnect', (reason, details) => {
 			console.log(`Socket ${_socket.id} disconnected due to ${reason}`);
+			socketConnected.set(false);
+
+			// Delay showing the disconnect toast so brief interruptions
+			// (e.g. mobile tab backgrounding) don't flash a nuisance warning
+			if (disconnectToastTimer) {
+				clearTimeout(disconnectToastTimer);
+			}
+			disconnectWarningShown = false;
+			disconnectToastTimer = setTimeout(() => {
+				disconnectToastTimer = null;
+				disconnectWarningShown = true;
+				toast.warning($i18n.t('Connection lost. Reconnecting...'));
+			}, DISCONNECT_TOAST_DELAY_MS);
+
+			if (heartbeatInterval) {
+				clearInterval(heartbeatInterval);
+				heartbeatInterval = null;
+			}
+
 			if (details) {
 				console.log('Additional details:', details);
 			}
 		});
-
-		_socket.on('user-list', (data) => {
-			console.log('user-list', data);
-			activeUserIds.set(data.user_ids);
-		});
-
-		_socket.on('usage', (data) => {
-			console.log('usage', data);
-			USAGE_POOL.set(data['models']);
-		});
 	};
 
-	const executePythonAsWorker = async (id, code, cb) => {
+	/**
+	 * Get or create the persistent Pyodide worker.
+	 * The worker persists across executions so the virtual FS (IDBFS) is preserved.
+	 */
+	const getOrCreateWorker = () => {
+		let worker = $pyodideWorker;
+		if (!worker) {
+			worker = createPyodideWorker();
+			pyodideWorker.set(worker);
+		}
+		return worker;
+	};
+
+	const executePythonAsWorker = async (id, code, cb, files = []) => {
 		let result = null;
 		let stdout = null;
 		let stderr = null;
 
 		let executing = true;
 		let packages = [
-			code.includes('requests') ? 'requests' : null,
-			code.includes('bs4') ? 'beautifulsoup4' : null,
-			code.includes('numpy') ? 'numpy' : null,
-			code.includes('pandas') ? 'pandas' : null,
-			code.includes('matplotlib') ? 'matplotlib' : null,
-			code.includes('sklearn') ? 'scikit-learn' : null,
-			code.includes('scipy') ? 'scipy' : null,
-			code.includes('re') ? 'regex' : null,
-			code.includes('seaborn') ? 'seaborn' : null,
-			code.includes('sympy') ? 'sympy' : null,
-			code.includes('tiktoken') ? 'tiktoken' : null,
-			code.includes('pytz') ? 'pytz' : null
+			/\bimport\s+requests\b|\bfrom\s+requests\b/.test(code) ? 'requests' : null,
+			/\bimport\s+bs4\b|\bfrom\s+bs4\b/.test(code) ? 'beautifulsoup4' : null,
+			/\bimport\s+numpy\b|\bfrom\s+numpy\b/.test(code) ? 'numpy' : null,
+			/\bimport\s+pandas\b|\bfrom\s+pandas\b/.test(code) ? 'pandas' : null,
+			/\bimport\s+matplotlib\b|\bfrom\s+matplotlib\b/.test(code) ? 'matplotlib' : null,
+			/\bimport\s+seaborn\b|\bfrom\s+seaborn\b/.test(code) ? 'seaborn' : null,
+			/\bimport\s+sklearn\b|\bfrom\s+sklearn\b/.test(code) ? 'scikit-learn' : null,
+			/\bimport\s+scipy\b|\bfrom\s+scipy\b/.test(code) ? 'scipy' : null,
+			/\bimport\s+re\b|\bfrom\s+re\b/.test(code) ? 'regex' : null,
+			/\bimport\s+seaborn\b|\bfrom\s+seaborn\b/.test(code) ? 'seaborn' : null,
+			/\bimport\s+sympy\b|\bfrom\s+sympy\b/.test(code) ? 'sympy' : null,
+			/\bimport\s+tiktoken\b|\bfrom\s+tiktoken\b/.test(code) ? 'tiktoken' : null,
+			/\bimport\s+pytz\b|\bfrom\s+pytz\b/.test(code) ? 'pytz' : null
 		].filter(Boolean);
 
-		const pyodideWorker = new PyodideWorker();
+		const worker = getOrCreateWorker();
 
-		pyodideWorker.postMessage({
+		// Fetch file content from the server and prepare for the worker
+		let filePayloads = [];
+		if (files && files.length > 0) {
+			for (const file of files) {
+				try {
+					const fileId = file?.id;
+					const fileName = file?.filename || file?.name || 'file';
+					if (fileId) {
+						const content = await getFileContentById(fileId);
+						if (content) {
+							filePayloads.push({ name: fileName, data: content });
+						}
+					}
+				} catch (e) {
+					console.error('Failed to fetch file for Pyodide:', e);
+				}
+			}
+		}
+
+		worker.postMessage({
+			type: 'execute',
 			id: id,
 			code: code,
-			packages: packages
+			packages: packages,
+			files: filePayloads.length > 0 ? filePayloads : undefined
 		});
 
-		setTimeout(() => {
+		// Timeout for this specific execution (not the worker itself)
+		let timeoutId = setTimeout(() => {
 			if (executing) {
 				executing = false;
 				stderr = 'Execution Time Limit Exceeded';
-				pyodideWorker.terminate();
+
+				// Terminate and recreate the worker on timeout
+				worker.terminate();
+				pyodideWorker.set(null);
 
 				if (cb) {
 					cb(
@@ -155,11 +329,18 @@
 			}
 		}, 60000);
 
-		pyodideWorker.onmessage = (event) => {
-			console.log('pyodideWorker.onmessage', event);
-			const { id, ...data } = event.data;
+		// Use addEventListener so multiple concurrent executions don't clobber each other
+		const onMessage = (event) => {
+			const { id: eventId, ...data } = event.data;
+			// Only handle responses for this execution ID
+			if (eventId !== id) return;
+			// Ignore FS responses (they use a type field)
+			if (data.type && data.type.startsWith('fs:')) return;
 
-			console.log(id, data);
+			console.log('pyodideWorker.onmessage', event);
+			clearTimeout(timeoutId);
+			worker.removeEventListener('message', onMessage);
+			worker.removeEventListener('error', onError);
 
 			data['stdout'] && (stdout = data['stdout']);
 			data['stderr'] && (stderr = data['stderr']);
@@ -183,8 +364,11 @@
 			executing = false;
 		};
 
-		pyodideWorker.onerror = (event) => {
+		const onError = (event) => {
 			console.log('pyodideWorker.onerror', event);
+			clearTimeout(timeoutId);
+			worker.removeEventListener('message', onMessage);
+			worker.removeEventListener('error', onError);
 
 			if (cb) {
 				cb(
@@ -202,37 +386,74 @@
 			}
 			executing = false;
 		};
+
+		worker.addEventListener('message', onMessage);
+		worker.addEventListener('error', onError);
 	};
 
-	const executeTool = async (data, cb) => {
-		const toolServer = $settings?.toolServers?.find((server) => server.url === data.server?.url);
-		const toolServerData = $toolServers?.find((server) => server.url === data.server?.url);
+	const resolveToolServer = (serverUrl) => {
+		let toolServer = $settings?.toolServers?.find((server) => server.url === serverUrl);
+		if (!toolServer) {
+			const terminalServer = ($settings?.terminalServers ?? []).find(
+				(server) => server.url === serverUrl
+			);
+			if (terminalServer) {
+				toolServer = {
+					url: terminalServer.url,
+					auth_type: terminalServer.auth_type ?? 'bearer',
+					key: terminalServer.key ?? '',
+					path: terminalServer.path ?? '/openapi.json'
+				};
+			}
+		}
+
+		let toolServerData =
+			$toolServers?.find((server) => server.url === serverUrl) ??
+			$terminalServers?.find((server) => server.url === serverUrl);
+
+		let token = null;
+		if (toolServer) {
+			const auth_type = toolServer?.auth_type ?? 'bearer';
+			if (auth_type === 'bearer') token = toolServer?.key;
+			else if (auth_type === 'session') token = localStorage.token;
+		}
+
+		return { toolServer, toolServerData, token };
+	};
+
+	const executeTool = async (data, cb, chatId) => {
+		const { toolServer, toolServerData, token } = resolveToolServer(data.server?.url);
 
 		console.log('executeTool', data, toolServer);
 
 		if (toolServer) {
-			console.log(toolServer);
 			const res = await executeToolServer(
-				(toolServer?.auth_type ?? 'bearer') === 'bearer' ? toolServer?.key : localStorage.token,
+				token,
 				toolServer.url,
 				data?.name,
 				data?.params,
-				toolServerData
+				toolServerData,
+				chatId
 			);
 
 			console.log('executeToolServer', res);
+
+			if (data?.name === 'display_file' && data?.params?.path) {
+				if (res?.exists !== false) {
+					displayFileHandler(data.params.path, { showControls, showFileNavPath });
+				}
+			}
+
+			if (['write_file'].includes(data?.name) && data?.params?.path) {
+				showFileNavDir.set(res?.path ?? data.params.path);
+			}
+
 			if (cb) {
-				cb(JSON.parse(JSON.stringify(res)));
+				cb(structuredClone(res));
 			}
 		} else {
 			if (cb) {
-				cb(
-					JSON.parse(
-						JSON.stringify({
-							error: 'Tool Server Not Found'
-						})
-					)
-				);
+				cb({ error: 'Tool Server Not Found' });
 			}
 		}
 	};
@@ -240,13 +461,21 @@
 	const chatEventHandler = async (event, cb) => {
 		const chat = $page.url.pathname.includes(`/c/${event.chat_id}`);
 
-		let isFocused = document.visibilityState !== 'visible';
+		// Skip events from temporary chats that are not the current chat.
+		// This prevents notifications from being sent to other tabs/devices
+		// for privacy, since temporary chats are not meant to be persisted or visible elsewhere.
+		const isTemporaryChat = event.chat_id?.startsWith('local:');
+		if (isTemporaryChat && event.chat_id !== $chatId) {
+			return;
+		}
+
+		let isInBackground = document.visibilityState !== 'visible';
 		if (window.electronAPI) {
 			const res = await window.electronAPI.send({
 				type: 'window:isFocused'
 			});
 			if (res) {
-				isFocused = res.isFocused;
+				isInBackground = !res.isFocused;
 			}
 		}
 
@@ -254,45 +483,50 @@
 		const type = event?.data?.type ?? null;
 		const data = event?.data?.data ?? null;
 
-		if ((event.chat_id !== $chatId && !$temporaryChatEnabled) || isFocused) {
-			if (type === 'chat:completion') {
-				const { done, content, title } = data;
+		// Calendar alerts are not chat-scoped, handle before chat_id checks
+		if (type === 'calendar:alert' && data) {
+			const timeStr =
+				data.minutes_until <= 0
+					? $i18n.t('Starting now')
+					: data.minutes_until === 1
+						? $i18n.t('Starting in 1 minute')
+						: $i18n.t('Starting in {{count}} minutes', { count: data.minutes_until });
 
-				if (done) {
-					if ($isLastActiveTab) {
-						if ($settings?.notificationEnabled ?? false) {
-							new Notification(`${title} | Open WebUI`, {
-								body: content,
-								icon: `${WEBUI_BASE_URL}/static/favicon.png`
-							});
-						}
-					}
+			toast.custom(NotificationToast, {
+				componentProps: {
+					onClick: () => {
+						goto('/calendar');
+					},
+					title: data.title,
+					content: timeStr
+				},
+				duration: 30000,
+				unstyled: true
+			});
 
-					toast.custom(NotificationToast, {
-						componentProps: {
-							onClick: () => {
-								goto(`/c/${event.chat_id}`);
-							},
-							content: content,
-							title: title
-						},
-						duration: 15000,
-						unstyled: true
+			if ($isLastActiveTab) {
+				if ($settings?.notificationEnabled ?? false) {
+					new Notification(`${data.title} • Open WebUI`, {
+						body: timeStr,
+						icon: `${WEBUI_BASE_URL}/static/favicon.png`
 					});
 				}
-			} else if (type === 'chat:title') {
-				currentChatPage.set(1);
-				await chats.set(await getChatList(localStorage.token, $currentChatPage));
-			} else if (type === 'chat:tags') {
-				tags.set(await getAllTags(localStorage.token));
 			}
-		} else if (data?.session_id === $socket.id) {
+			return;
+		}
+
+		// Session-targeted RPC calls (code execution, tool calls, direct completion)
+		// must ALWAYS be processed regardless of active chat or tab visibility,
+		// because the backend's sio.call blocks waiting for our callback response.
+		if (data?.session_id === $socket.id) {
 			if (type === 'execute:python') {
 				console.log('execute:python', data);
-				executePythonAsWorker(data.id, data.code, cb);
+				executePythonAsWorker(data.id, data.code, cb, data.files || []);
+				return;
 			} else if (type === 'execute:tool') {
 				console.log('execute:tool', data);
-				executeTool(data, cb);
+				executeTool(data, cb, event.chat_id);
+				return;
 			} else if (type === 'request:chat:completion') {
 				console.log(data, $socket.id);
 				const { session_id, channel, form_data, model } = data;
@@ -378,41 +612,143 @@
 						done: true
 					});
 				}
-			} else {
-				console.log('chatEventHandler', event);
+				return;
+			}
+		}
+
+		if ((event.chat_id !== $chatId && !$temporaryChatEnabled) || isInBackground) {
+			if (type === 'chat:completion') {
+				const { done, content, output, title } = data;
+				const displayTitle = title || $i18n.t('New Chat');
+				const contentPreview = cleanText(removeAllDetails(getOutputText(output) || content || ''));
+
+				if (done) {
+					if (
+						($settings?.notificationSound ?? true) &&
+						($settings?.notificationSoundAlways ?? false)
+					) {
+						playingNotificationSound.set(true);
+
+						const audio = new Audio(`/audio/notification.mp3`);
+						audio.play().finally(() => {
+							// Ensure the global state is reset after the sound finishes
+							playingNotificationSound.set(false);
+						});
+					}
+
+					if ($isLastActiveTab) {
+						if ($settings?.notificationEnabled ?? false) {
+							new Notification(`${displayTitle} • Open WebUI`, {
+								body: contentPreview,
+								icon: `${WEBUI_BASE_URL}/static/favicon.png`
+							});
+						}
+					}
+
+					toast.custom(NotificationToast, {
+						componentProps: {
+							onClick: () => {
+								goto(`/c/${event.chat_id}`);
+							},
+							content: contentPreview,
+							title: displayTitle
+						},
+						duration: 15000,
+						unstyled: true
+					});
+				}
+			} else if (type === 'chat:title') {
+				currentChatPage.set(1);
+				await chats.set(await getChatList(localStorage.token, $currentChatPage));
+			} else if (type === 'chat:tags') {
+				tags.set(await getAllTags(localStorage.token));
 			}
 		}
 	};
 
 	const channelEventHandler = async (event) => {
+		console.log('channelEventHandler', event);
 		if (event.data?.type === 'typing') {
+			return;
+		}
+
+		// handle channel created event
+		if (event.data?.type === 'channel:created') {
+			const res = await getChannels(localStorage.token).catch(async (error) => {
+				return null;
+			});
+
+			if (res) {
+				await channels.set(
+					res.sort(
+						(a, b) =>
+							['', null, 'group', 'dm'].indexOf(a.type) - ['', null, 'group', 'dm'].indexOf(b.type)
+					)
+				);
+			}
+
 			return;
 		}
 
 		// check url path
 		const channel = $page.url.pathname.includes(`/channels/${event.channel_id}`);
 
-		let isFocused = document.visibilityState !== 'visible';
+		let isInBackground = document.visibilityState !== 'visible';
 		if (window.electronAPI) {
 			const res = await window.electronAPI.send({
 				type: 'window:isFocused'
 			});
 			if (res) {
-				isFocused = res.isFocused;
+				isInBackground = !res.isFocused;
 			}
 		}
 
-		if ((!channel || isFocused) && event?.user?.id !== $user?.id) {
+		if ((!channel || isInBackground) && event?.user?.id !== $user?.id) {
 			await tick();
 			const type = event?.data?.type ?? null;
 			const data = event?.data?.data ?? null;
 
+			if ($channels) {
+				if ($channels.find((ch) => ch.id === event.channel_id) && $channelId !== event.channel_id) {
+					channels.set(
+						$channels.map((ch) => {
+							if (ch.id === event.channel_id) {
+								if (type === 'message') {
+									return {
+										...ch,
+										unread_count: (ch.unread_count ?? 0) + 1,
+										last_message_at: event.created_at
+									};
+								}
+							}
+							return ch;
+						})
+					);
+				} else {
+					const res = await getChannels(localStorage.token).catch(async (error) => {
+						return null;
+					});
+
+					if (res) {
+						await channels.set(
+							res.sort(
+								(a, b) =>
+									['', null, 'group', 'dm'].indexOf(a.type) -
+									['', null, 'group', 'dm'].indexOf(b.type)
+							)
+						);
+					}
+				}
+			}
+
 			if (type === 'message') {
+				const title = `${data?.user?.name}${event?.channel?.type !== 'dm' ? ` (#${event?.channel?.name})` : ''}`;
+
 				if ($isLastActiveTab) {
 					if ($settings?.notificationEnabled ?? false) {
-						new Notification(`${data?.user?.name} (#${event?.channel?.name}) | Open WebUI`, {
+						new Notification(`${title} • Open WebUI`, {
 							body: data?.content,
-							icon: data?.user?.profile_image_url ?? `${WEBUI_BASE_URL}/static/favicon.png`
+							icon: `${WEBUI_API_BASE_URL}/users/${data?.user?.id}/profile/image`
 						});
 					}
 				}
@@ -423,7 +759,7 @@
 							goto(`/channels/${event.channel_id}`);
 						},
 						content: data?.content,
-						title: event?.channel?.name
+						title: `${title}`
 					},
 					duration: 15000,
 					unstyled: true
@@ -432,9 +768,247 @@
 		}
 	};
 
+	const TOKEN_EXPIRY_BUFFER = 60; // seconds
+	const resolveFetchUrl = (input) => {
+		if (input instanceof Request) {
+			return new URL(input.url, window.location.origin);
+		}
+
+		return new URL(input, window.location.origin);
+	};
+
+	const resolveFetchHeaders = (input, init) => {
+		if (init?.headers) {
+			return new Headers(init.headers);
+		}
+
+		if (input instanceof Request) {
+			return input.headers;
+		}
+
+		return new Headers();
+	};
+
+	const isAuthenticatedBackendFetch = (input, init) => {
+		try {
+			const requestUrl = resolveFetchUrl(input);
+			const backendOrigin = new URL(WEBUI_BASE_URL || '/', window.location.origin).origin;
+
+			return (
+				requestUrl.origin === backendOrigin && resolveFetchHeaders(input, init).has('authorization')
+			);
+		} catch {
+			return false;
+		}
+	};
+
+	const redirectToAuthAfterUnauthorized = () => {
+		if (isAuthRedirectInProgress || window.location.pathname === '/auth') {
+			return;
+		}
+
+		isAuthRedirectInProgress = true;
+		user.set(null);
+		localStorage.removeItem('token');
+		toast.error($i18n.t('Session expired. Please sign in again.'));
+
+		const currentPath = `${window.location.pathname}${window.location.search}`;
+		goto(`/auth?redirect=${encodeURIComponent(currentPath)}`).finally(() => {
+			isAuthRedirectInProgress = false;
+		});
+	};
+
+	const isCurrentSessionUnauthorized = async (originalFetch) => {
+		return originalFetch(`${WEBUI_API_BASE_URL}/auths/`, {
+			method: 'GET',
+			headers: {
+				'Content-Type': 'application/json',
+				Authorization: `Bearer ${localStorage.token}`
+			},
+			credentials: 'include'
+		})
+			.then((res) => res.status === 401)
+			.catch(() => false);
+	};
+
+	const checkTokenExpiry = async () => {
+		const exp = $user?.expires_at; // token expiry time in unix timestamp
+		const now = Math.floor(Date.now() / 1000); // current time in unix timestamp
+
+		if (!exp) {
+			// If no expiry time is set, do nothing
+			return;
+		}
+
+		if (now >= exp - TOKEN_EXPIRY_BUFFER) {
+			const res = await userSignOut();
+			user.set(null);
+			localStorage.removeItem('token');
+
+			location.href = res?.redirect_url ?? '/auth';
+		}
+	};
+
+	const desktopEventHandler = async (event) => {
+		// Events that don't require auth
+		if (event.type === 'page:reload') {
+			location.reload();
+			return;
+		}
+		if (event.type === 'page:navigate' && event.data?.path) {
+			await goto(event.data.path);
+			return;
+		}
+		if (event.type === 'query' && (event.data?.query || event.data?.files?.length)) {
+			desktopEvent.set(event);
+			await goto('/');
+			return;
+		}
+		if (event.type === 'call') {
+			desktopEvent.set(event);
+			await goto('/');
+			return;
+		}
+		if (event.type === 'theme:update' && event.data?.theme) {
+			const newTheme = event.data.theme;
+			localStorage.setItem('theme', newTheme);
+			theme.set(newTheme);
+
+			// Apply theme classes (mirrors logic from chat/Settings/General.svelte)
+			const themes = ['dark', 'light', 'oled-dark'];
+			let themeToApply =
+				newTheme === 'oled-dark' ? 'dark' : newTheme === 'her' ? 'light' : newTheme;
+			if (newTheme === 'system') {
+				themeToApply = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+			}
+			themes
+				.filter((e) => e !== themeToApply)
+				.forEach((e) => {
+					e.split(' ').forEach((cls) => document.documentElement.classList.remove(cls));
+				});
+			themeToApply.split(' ').forEach((cls) => document.documentElement.classList.add(cls));
+			return;
+		}
+		if (event.type === 'models:refresh') {
+			const token = localStorage.token;
+			if (token) {
+				models.set(
+					await getModels(
+						token,
+						$config?.features?.enable_direct_connections
+							? ($settings?.directConnections ?? null)
+							: null
+					)
+				);
+			}
+			return;
+		}
+
+		const token = localStorage.token;
+		if (!token) return;
+
+		// Only admins can modify system-level connections
+		if ($user?.role !== 'admin') return;
+
+		try {
+			if (event.type === 'connections:terminal') {
+				if (event.data.action === 'add') {
+					await addTerminalConnection(token, {
+						url: event.data.url,
+						key: event.data.key,
+						name: 'Local Open Terminal'
+					});
+				} else if (event.data.action === 'remove') {
+					await removeTerminalConnection(token, event.data.url);
+				}
+			} else if (event.type === 'connections:openai') {
+				if (event.data.action === 'add') {
+					await addOpenAIConnection(token, {
+						url: event.data.url,
+						key: event.data.key,
+						config: event.data.config
+					});
+				} else if (event.data.action === 'remove') {
+					await removeOpenAIConnection(token, event.data.url);
+				}
+			}
+		} catch (e) {
+			console.error('Desktop connection update failed:', e);
+		}
+	};
+
+	const windowMessageEventHandler = async (event) => {
+		if (
+			!['https://openwebui.com', 'https://www.openwebui.com', 'http://localhost:9999'].includes(
+				event.origin
+			)
+		) {
+			return;
+		}
+
+		if (event.data === 'export:stats' || event.data?.type === 'export:stats') {
+			syncStatsEventData = event.data;
+			showSyncStatsModal = true;
+		}
+	};
+
 	onMount(async () => {
-		if (typeof window !== 'undefined' && window.applyTheme) {
-			window.applyTheme();
+		const originalFetch = window.fetch.bind(window);
+		window.fetch = async (input, init) => {
+			const response = await originalFetch(input, init);
+
+			if (
+				response.status === 401 &&
+				localStorage.token &&
+				isAuthenticatedBackendFetch(input, init) &&
+				(await isCurrentSessionUnauthorized(originalFetch))
+			) {
+				redirectToAuthAfterUnauthorized();
+			}
+
+			return response;
+		};
+
+		window.addEventListener('message', windowMessageEventHandler);
+
+		let touchstartY = 0;
+
+		function isNavOrDescendant(el) {
+			const nav = document.querySelector('nav'); // change selector if needed
+			return nav && (el === nav || nav.contains(el));
+		}
+
+		const touchstartHandler = (e) => {
+			if (!isNavOrDescendant(e.target)) return;
+			touchstartY = e.touches[0].clientY;
+		};
+
+		const touchmoveHandler = (e) => {
+			if (!isNavOrDescendant(e.target)) return;
+			const touchY = e.touches[0].clientY;
+			const touchDiff = touchY - touchstartY;
+			if (touchDiff > 50 && window.scrollY === 0) {
+				showRefresh = true;
+				e.preventDefault();
+			}
+		};
+
+		const touchendHandler = (e) => {
+			if (!isNavOrDescendant(e.target)) return;
+			if (showRefresh) {
+				showRefresh = false;
+				location.reload();
+			}
+		};
+
+		document.addEventListener('touchstart', touchstartHandler);
+		document.addEventListener('touchmove', touchmoveHandler, { passive: false });
+		document.addEventListener('touchend', touchendHandler);
+
+		if (typeof window !== 'undefined') {
+			if (window.applyTheme) {
+				window.applyTheme();
+			}
 		}
 
 		if (window?.electronAPI) {
@@ -454,6 +1028,11 @@
 					appData.set(data);
 				}
 			}
+
+			// Listen for desktop service lifecycle events (scalable protocol)
+			if (window.electronAPI.onEvent) {
+				window.electronAPI.onEvent(desktopEventHandler);
+			}
 		}
 
 		// Listen for messages on the BroadcastChannel
@@ -468,6 +1047,9 @@
 			if (document.visibilityState === 'visible') {
 				isLastActiveTab.set(true); // This tab is now the active tab
 				bc.postMessage('active'); // Notify other tabs that this tab is active
+
+				// Check token expiry when the tab becomes active
+				checkTokenExpiry();
 			}
 		};
 
@@ -490,16 +1072,22 @@
 		};
 		window.addEventListener('resize', onResize);
 
-		user.subscribe((value) => {
+		user.subscribe(async (value) => {
 			if (value) {
-				$socket?.off('chat-events', chatEventHandler);
-				$socket?.off('channel-events', channelEventHandler);
+				$socket?.off('events', chatEventHandler);
+				$socket?.off('events:channel', channelEventHandler);
 
-				$socket?.on('chat-events', chatEventHandler);
-				$socket?.on('channel-events', channelEventHandler);
+				$socket?.on('events', chatEventHandler);
+				$socket?.on('events:channel', channelEventHandler);
+
+				// Set up the token expiry check
+				if (tokenTimer) {
+					clearInterval(tokenTimer);
+				}
+				tokenTimer = setInterval(checkTokenExpiry, 15000);
 			} else {
-				$socket?.off('chat-events', chatEventHandler);
-				$socket?.off('channel-events', channelEventHandler);
+				$socket?.off('events', chatEventHandler);
+				$socket?.off('events:channel', channelEventHandler);
 			}
 		});
 
@@ -508,6 +1096,12 @@
 			backendConfig = await getBackendConfig();
 			console.log('Backend config:', backendConfig);
 		} catch (error) {
+			if (error?.authRedirect) {
+				// Forward-auth proxy is redirecting to an external login page.
+				// Full-page navigation lets the browser follow the redirect natively.
+				window.location.href = '/';
+				return;
+			}
 			console.error('Error loading backend config:', error);
 		}
 		// Initialize i18n even if we didn't get a backend config,
@@ -519,10 +1113,11 @@
 			const browserLanguages = navigator.languages
 				? navigator.languages
 				: [navigator.language || navigator.userLanguage];
-			const lang = backendConfig.default_locale
+			const lang = backendConfig?.default_locale
 				? backendConfig.default_locale
 				: bestMatchingLanguage(languages, browserLanguages, 'en-US');
 			changeLanguage(lang);
+			dayjs.locale(lang);
 		}
 
 		if (backendConfig) {
@@ -544,11 +1139,28 @@
 					});
 
 					if (sessionUser) {
-						// Save Session User to Store
-						$socket.emit('user-join', { auth: { token: sessionUser.token } });
-
 						await user.set(sessionUser);
-						await config.set(await getBackendConfig());
+						try {
+							await config.set(await getBackendConfig());
+						} catch (error) {
+							console.error('Error refreshing backend config:', error);
+						}
+
+						// Keep user timezone in sync on every app load/refresh
+						const timezone = getUserTimezone();
+						if (timezone) {
+							updateUserTimezone(localStorage.token, timezone);
+						}
+
+						// Relay auth token to desktop app for API access
+						if (window.electronAPI?.send) {
+							window.electronAPI
+								.send({
+									type: 'token:update',
+									token: localStorage.token
+								})
+								.catch(() => {});
+						}
 					} else {
 						// Redirect Invalid Session User to /auth Page
 						localStorage.removeItem('token');
@@ -599,9 +1211,27 @@
 			loaded = true;
 		}
 
+		// Auto-show SyncStatsModal when opened with ?sync=true (from community)
+		if (
+			(window.opener ?? false) &&
+			$page.url.searchParams.get('sync') === 'true' &&
+			($config?.features?.enable_community_sharing ?? false)
+		) {
+			showSyncStatsModal = true;
+		}
+
 		return () => {
 			window.removeEventListener('resize', onResize);
+			window.removeEventListener('message', windowMessageEventHandler);
+			document.removeEventListener('touchstart', touchstartHandler);
+			document.removeEventListener('touchmove', touchmoveHandler);
+			document.removeEventListener('touchend', touchendHandler);
+			document.removeEventListener('visibilitychange', handleVisibilityChange);
 		};
+	});
+
+	onDestroy(() => {
+		bc.close();
 	});
 </script>
 
@@ -609,11 +1239,22 @@
 	<title>{$WEBUI_NAME}</title>
 	<link crossorigin="anonymous" rel="icon" href="{WEBUI_BASE_URL}/static/favicon.png" />
 
-	<!-- rosepine themes have been disabled as it's not up to date with our latest version. -->
-	<!-- feel free to make a PR to fix if anyone wants to see it return -->
-	<!-- <link rel="stylesheet" type="text/css" href="/themes/rosepine.css" />
-	<link rel="stylesheet" type="text/css" href="/themes/rosepine-dawn.css" /> -->
+	<meta name="apple-mobile-web-app-title" content={$WEBUI_NAME} />
+	<meta name="description" content={$WEBUI_NAME} />
+	<link
+		rel="search"
+		type="application/opensearchdescription+xml"
+		title={$WEBUI_NAME}
+		href="/opensearch.xml"
+		crossorigin="use-credentials"
+	/>
 </svelte:head>
+
+{#if showRefresh}
+	<div class=" py-5">
+		<Spinner className="size-5" />
+	</div>
+{/if}
 
 {#if loaded}
 	{#if $isApp}
@@ -629,6 +1270,10 @@
 	{/if}
 {/if}
 
+{#if $config?.features.enable_community_sharing}
+	<SyncStatsModal bind:show={showSyncStatsModal} eventData={syncStatsEventData} />
+{/if}
+
 <Toaster
 	theme={$theme.includes('dark')
 		? 'dark'
@@ -639,4 +1284,11 @@
 			: 'light'}
 	richColors
 	position="top-right"
+	closeButton
+	toastOptions={{
+		classes: {
+			closeButton:
+				'!bg-white/80 !text-gray-500 !border-gray-200 hover:!bg-gray-50 hover:!text-gray-700 dark:!bg-gray-850 dark:!text-gray-400 dark:!border-gray-700 dark:hover:!bg-gray-800 dark:hover:!text-gray-200'
+		}
+	}}
 />

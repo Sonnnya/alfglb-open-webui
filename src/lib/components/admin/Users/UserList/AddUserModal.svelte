@@ -6,7 +6,11 @@
 
 	import { WEBUI_BASE_URL } from '$lib/constants';
 
+	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Modal from '$lib/components/common/Modal.svelte';
+	import { generateInitialsImage } from '$lib/utils';
+	import XMark from '$lib/components/icons/XMark.svelte';
+	import SensitiveInput from '$lib/components/common/SensitiveInput.svelte';
 
 	const i18n = getContext('i18n');
 	const dispatch = createEventDispatcher();
@@ -47,7 +51,8 @@
 				_user.name,
 				_user.email,
 				_user.password,
-				_user.role
+				_user.role,
+				generateInitialsImage(_user.name)
 			).catch((error) => {
 				toast.error(`${error}`);
 			});
@@ -67,38 +72,55 @@
 					const csv = e.target.result;
 					const rows = csv.split('\n');
 
-					let userCount = 0;
+					const validRows = [];
 
 					for (const [idx, row] of rows.entries()) {
 						const columns = row.split(',').map((col) => col.trim());
-						console.log(idx, columns);
+						console.debug(idx, columns);
 
 						if (idx > 0) {
 							if (
 								columns.length === 4 &&
 								['admin', 'user', 'pending'].includes(columns[3].toLowerCase())
 							) {
-								const res = await addUser(
-									localStorage.token,
-									columns[0],
-									columns[1],
-									columns[2],
-									columns[3].toLowerCase()
-								).catch((error) => {
-									toast.error(`Row ${idx + 1}: ${error}`);
-									return null;
-								});
-
-								if (res) {
-									userCount = userCount + 1;
-								}
+								validRows.push({ idx, columns });
 							} else {
 								toast.error(`Row ${idx + 1}: invalid format.`);
 							}
 						}
 					}
 
-					toast.success(`Successfully imported ${userCount} users.`);
+					let userCount = 0;
+					const BATCH_SIZE = 10;
+
+					for (let i = 0; i < validRows.length; i += BATCH_SIZE) {
+						const batch = validRows.slice(i, i + BATCH_SIZE);
+						const results = await Promise.allSettled(
+							batch.map(({ idx, columns }) =>
+								addUser(
+									localStorage.token,
+									columns[0],
+									columns[1],
+									columns[2],
+									columns[3].toLowerCase(),
+									generateInitialsImage(columns[0])
+								).catch((error) => {
+									toast.error(`Row ${idx + 1}: ${error}`);
+									return null;
+								})
+							)
+						);
+
+						for (const result of results) {
+							if (result.status === 'fulfilled' && result.value) {
+								userCount++;
+							}
+						}
+					}
+
+					toast.success(
+						$i18n.t('Successfully imported {{userCount}} users.', { userCount: userCount })
+					);
 					inputFiles = null;
 					const uploadInputElement = document.getElementById('upload-user-csv-input');
 
@@ -109,7 +131,7 @@
 					stopLoading();
 				};
 
-				reader.readAsText(file);
+				reader.readAsText(file, 'utf-8');
 			} else {
 				toast.error($i18n.t('File not found.'));
 			}
@@ -125,20 +147,12 @@
 			<div class=" text-lg font-medium self-center">{$i18n.t('Add User')}</div>
 			<button
 				class="self-center"
+				aria-label={$i18n.t('Close')}
 				on:click={() => {
 					show = false;
 				}}
 			>
-				<svg
-					xmlns="http://www.w3.org/2000/svg"
-					viewBox="0 0 20 20"
-					fill="currentColor"
-					class="w-5 h-5"
-				>
-					<path
-						d="M6.28 5.22a.75.75 0 00-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 101.06 1.06L10 11.06l3.72 3.72a.75.75 0 101.06-1.06L11.06 10l3.72-3.72a.75.75 0 00-1.06-1.06L10 8.94 6.28 5.22z"
-					/>
-				</svg>
+				<XMark className={'size-5'} />
 			</button>
 		</div>
 
@@ -154,7 +168,7 @@
 						class="flex -mt-2 mb-1.5 gap-1 scrollbar-none overflow-x-auto w-fit text-center text-sm font-medium rounded-full bg-transparent dark:text-gray-200"
 					>
 						<button
-							class="min-w-fit rounded-full p-1.5 {tab === ''
+							class="min-w-fit p-1.5 {tab === ''
 								? ''
 								: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition"
 							type="button"
@@ -164,7 +178,7 @@
 						>
 
 						<button
-							class="min-w-fit rounded-full p-1.5 {tab === 'import'
+							class="min-w-fit p-1.5 {tab === 'import'
 								? ''
 								: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition"
 							type="button"
@@ -183,6 +197,7 @@
 									<select
 										class="w-full capitalize rounded-lg text-sm bg-transparent dark:disabled:text-gray-500 outline-hidden"
 										bind:value={_user.role}
+										aria-label={$i18n.t('Role')}
 										placeholder={$i18n.t('Enter Your Role')}
 										required
 									>
@@ -201,6 +216,7 @@
 										class="w-full text-sm bg-transparent disabled:text-gray-500 dark:disabled:text-gray-500 outline-hidden"
 										type="text"
 										bind:value={_user.name}
+										aria-label={$i18n.t('Name')}
 										placeholder={$i18n.t('Enter Your Full Name')}
 										autocomplete="off"
 										required
@@ -208,7 +224,7 @@
 								</div>
 							</div>
 
-							<hr class=" border-gray-100 dark:border-gray-850 my-2.5 w-full" />
+							<hr class=" border-gray-100/30 dark:border-gray-850/30 my-2.5 w-full" />
 
 							<div class="flex flex-col w-full">
 								<div class=" mb-1 text-xs text-gray-500">{$i18n.t('Email')}</div>
@@ -218,6 +234,7 @@
 										class="w-full text-sm bg-transparent disabled:text-gray-500 dark:disabled:text-gray-500 outline-hidden"
 										type="email"
 										bind:value={_user.email}
+										aria-label={$i18n.t('Email')}
 										placeholder={$i18n.t('Enter Your Email')}
 										required
 									/>
@@ -228,12 +245,14 @@
 								<div class=" mb-1 text-xs text-gray-500">{$i18n.t('Password')}</div>
 
 								<div class="flex-1">
-									<input
+									<SensitiveInput
 										class="w-full text-sm bg-transparent disabled:text-gray-500 dark:disabled:text-gray-500 outline-hidden"
 										type="password"
 										bind:value={_user.password}
+										aria-label={$i18n.t('Password')}
 										placeholder={$i18n.t('Enter Your Password')}
 										autocomplete="off"
+										required
 									/>
 								</div>
 							</div>
@@ -280,7 +299,7 @@
 
 					<div class="flex justify-end pt-3 text-sm font-medium">
 						<button
-							class="px-3.5 py-1.5 text-sm font-medium bg-black hover:bg-gray-900 text-white dark:bg-white dark:text-black dark:hover:bg-gray-100 transition rounded-full flex flex-row space-x-1 items-center {loading
+							class="px-3.5 py-1.5 text-sm font-medium bg-black hover:bg-gray-900 text-white dark:bg-white dark:text-black dark:hover:bg-gray-100 transition rounded-full flex items-center gap-2 whitespace-nowrap {loading
 								? ' cursor-not-allowed'
 								: ''}"
 							type="submit"
@@ -289,31 +308,9 @@
 							{$i18n.t('Save')}
 
 							{#if loading}
-								<div class="ml-2 self-center">
-									<svg
-										class=" w-4 h-4"
-										viewBox="0 0 24 24"
-										fill="currentColor"
-										xmlns="http://www.w3.org/2000/svg"
-										><style>
-											.spinner_ajPY {
-												transform-origin: center;
-												animation: spinner_AtaB 0.75s infinite linear;
-											}
-											@keyframes spinner_AtaB {
-												100% {
-													transform: rotate(360deg);
-												}
-											}
-										</style><path
-											d="M12,1A11,11,0,1,0,23,12,11,11,0,0,0,12,1Zm0,19a8,8,0,1,1,8-8A8,8,0,0,1,12,20Z"
-											opacity=".25"
-										/><path
-											d="M10.14,1.16a11,11,0,0,0-9,8.92A1.59,1.59,0,0,0,2.46,12,1.52,1.52,0,0,0,4.11,10.7a8,8,0,0,1,6.66-6.61A1.42,1.42,0,0,0,12,2.69h0A1.57,1.57,0,0,0,10.14,1.16Z"
-											class="spinner_ajPY"
-										/></svg
-									>
-								</div>
+								<span class="shrink-0">
+									<Spinner />
+								</span>
 							{/if}
 						</button>
 					</div>

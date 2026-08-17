@@ -15,10 +15,14 @@ export const getGravatarUrl = async (token: string, email: string) => {
 			return res.json();
 		})
 		.catch((err) => {
-			console.log(err);
-			error = err;
+			console.error(err);
+			error = err.detail ?? err;
 			return null;
 		});
+
+	if (error) {
+		throw error;
+	}
 
 	return res;
 };
@@ -41,7 +45,7 @@ export const executeCode = async (token: string, code: string) => {
 			return res.json();
 		})
 		.catch((err) => {
-			console.log(err);
+			console.error(err);
 
 			error = err;
 			if (err.detail) {
@@ -75,7 +79,7 @@ export const formatPythonCode = async (token: string, code: string) => {
 			return res.json();
 		})
 		.catch((err) => {
-			console.log(err);
+			console.error(err);
 
 			error = err;
 			if (err.detail) {
@@ -110,38 +114,12 @@ export const downloadChatAsPDF = async (token: string, title: string, messages: 
 			return res.blob();
 		})
 		.catch((err) => {
-			console.log(err);
+			console.error(err);
 			error = err;
 			return null;
 		});
 
 	return blob;
-};
-
-export const getHTMLFromMarkdown = async (token: string, md: string) => {
-	let error = null;
-
-	const res = await fetch(`${WEBUI_API_BASE_URL}/utils/markdown`, {
-		method: 'POST',
-		headers: {
-			'Content-Type': 'application/json',
-			Authorization: `Bearer ${token}`
-		},
-		body: JSON.stringify({
-			md: md
-		})
-	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
-		.catch((err) => {
-			console.log(err);
-			error = err;
-			return null;
-		});
-
-	return res.html;
 };
 
 export const downloadDatabase = async (token: string) => {
@@ -170,43 +148,7 @@ export const downloadDatabase = async (token: string) => {
 			window.URL.revokeObjectURL(url);
 		})
 		.catch((err) => {
-			console.log(err);
-			error = err.detail;
-			return null;
-		});
-
-	if (error) {
-		throw error;
-	}
-};
-
-export const downloadLiteLLMConfig = async (token: string) => {
-	let error = null;
-
-	const res = await fetch(`${WEBUI_API_BASE_URL}/utils/litellm/config`, {
-		method: 'GET',
-		headers: {
-			'Content-Type': 'application/json',
-			Authorization: `Bearer ${token}`
-		}
-	})
-		.then(async (response) => {
-			if (!response.ok) {
-				throw await response.json();
-			}
-			return response.blob();
-		})
-		.then((blob) => {
-			const url = window.URL.createObjectURL(blob);
-			const a = document.createElement('a');
-			a.href = url;
-			a.download = 'config.yaml';
-			document.body.appendChild(a);
-			a.click();
-			window.URL.revokeObjectURL(url);
-		})
-		.catch((err) => {
-			console.log(err);
+			console.error(err);
 			error = err.detail;
 			return null;
 		});

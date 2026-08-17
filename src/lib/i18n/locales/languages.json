@@ -16,12 +16,20 @@
 		"title": "Arabic (Bahrain)"
 	},
 	{
+		"code": "az-AZ",
+		"title": "Azərbaycanca"
+	},
+	{
 		"code": "eu-ES",
 		"title": "Basque (Euskara)"
 	},
 	{
 		"code": "bn-BD",
 		"title": "Bengali (বাংলা)"
+	},
+	{
+		"code": "bs-BA",
+		"title": "Bosanski Latinica"
 	},
 	{
 		"code": "bo-TB",
@@ -72,6 +80,10 @@
 		"title": "French (France)"
 	},
 	{
+		"code": "gl-ES",
+		"title": "Galician (Galego)"
+	},
+	{
 		"code": "ka-GE",
 		"title": "Georgian (ქართული)"
 	},
@@ -112,12 +124,20 @@
 		"title": "Japanese (日本語)"
 	},
 	{
+		"code": "kab-DZ",
+		"title": "Kabyle (Taqbaylit)"
+	},
+	{
 		"code": "ko-KR",
 		"title": "Korean (한국어)"
 	},
 	{
 		"code": "lt-LT",
 		"title": "Lithuanian (Lietuvių)"
+	},
+	{
+		"code": "lv-LV",
+		"title": "Latvian (Latviešu)"
 	},
 	{
 		"code": "ms-MY",
@@ -172,6 +192,14 @@
 		"title": "Swedish (Svenska)"
 	},
 	{
+		"code": "fil-PH",
+		"title": "Tagalog (Filipino)"
+	},
+	{
+		"code": "ta-IN",
+		"title": "தமிழ் (இந்தியா)"
+	},
+	{
 		"code": "th-TH",
 		"title": "Thailand (ไทย)"
 	},
@@ -180,7 +208,7 @@
 		"title": "Turkish (Türkçe)"
 	},
 	{
-		"code": "tk-TW",
+		"code": "tk-TM",
 		"title": "Turkmen (Türkmençe)"
 	},
 	{
@@ -190,6 +218,18 @@
 	{
 		"code": "ur-PK",
 		"title": "Urdu (اردو)"
+	},
+	{
+		"code": "ug-CN",
+		"title": "Uyghur (ئۇيغۇرچە)"
+	},
+	{
+		"code": "uz-Cyrl-UZ",
+		"title": "Uzbek (Cyrillic)"
+	},
+	{
+		"code": "uz-Latn-UZ",
+		"title": "Uzbek (Latin)"
 	},
 	{
 		"code": "vi-VN",
