@@ -1,6 +1,12 @@
 # ALFGLB
 
+## develop
+
+For frontend follow this:
+
 https://docs.openwebui.com/getting-started/advanced-topics/development/
+
+For backend follow this:
 
 ```
 cd backend
@@ -8,7 +14,44 @@ uv venv --python 3.11
 uv pip install -r requirements.txt  
 venv\Scripts\activate
 uvicorn open_webui.main:app --port 8080 --host 0.0.0.0 --forwarded-allow-ips "${FORWARDED_ALLOW_IPS:-*}" --reload   
-```                                                                      
+```    
+
+## debug
+
+You might want to reset this env var:
+
+```
+$env:WEBUI_SECRET_KEY = "your-key" #TODO: make this unnecesary
+```
+
+```.vscode/launch.json
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: FastAPI (uvicorn)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "uvicorn",
+            "args": [
+                "open_webui.main:app",
+                "--reload",
+                "--port",
+                "8080",
+                "--host",
+                "0.0.0.0",
+            ],
+            "cwd": "${workspaceFolder}/backend",
+            "python": "${workspaceFolder}/backend/.venv/Scripts/python.exe",
+            "justMyCode": true,
+            "subProcess": true,
+        }
+    ]
+}
+```
 
 # Open WebUI 👋
 
