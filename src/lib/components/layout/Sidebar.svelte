@@ -79,13 +79,18 @@
 	import Sidebar from '../icons/Sidebar.svelte';
 	import PinnedModelList from './Sidebar/PinnedModelList.svelte';
 	import PinnedNoteList from './Sidebar/PinnedNoteList.svelte';
-	import Note from '../icons/Note.svelte';
 	import Code from '../icons/Code.svelte';
 	import { slide } from 'svelte/transition';
 	import HotkeyHint from '../common/HotkeyHint.svelte';
+	import BookOpen from '../icons/BookOpen.svelte';
+	import {
+		DEFAULT_PINNED_ITEMS,
+		getMenuItemMeta,
+		isMenuItemVisible as isMenuItemVisibleFor,
+		migratePinnedItems
+	} from '$lib/utils/menu-items';
 
 	const BREAKPOINT = 768;
-	const DEFAULT_PINNED_ITEMS = ['notes', 'workspace'];
 
 	let scrollTop = 0;
 
@@ -116,51 +121,9 @@
 
 	let sharedFolders: any[] = [];
 
-	$: pinnedItems = $settings?.pinnedMenuItems ?? DEFAULT_PINNED_ITEMS;
+	$: pinnedItems = migratePinnedItems($settings?.pinnedMenuItems ?? DEFAULT_PINNED_ITEMS);
 
-	const isMenuItemVisible = (id) => {
-		switch (id) {
-			case 'notes':
-				return (
-					($config?.features?.enable_notes ?? false) &&
-					($user?.role === 'admin' || ($user?.permissions?.features?.notes ?? true))
-				);
-			case 'workspace':
-				return (
-					$user?.role === 'admin' ||
-					$user?.permissions?.workspace?.models ||
-					$user?.permissions?.workspace?.knowledge ||
-					$user?.permissions?.workspace?.prompts ||
-					$user?.permissions?.workspace?.tools ||
-					$user?.permissions?.workspace?.skills
-				);
-			case 'automations':
-				return (
-					$config?.features?.enable_automations &&
-					($user?.role === 'admin' || $user?.permissions?.features?.automations)
-				);
-			case 'calendar':
-				return (
-					$config?.features?.enable_calendar &&
-					($user?.role === 'admin' || $user?.permissions?.features?.calendar)
-				);
-			case 'playground':
-				return $user?.role === 'admin';
-			default:
-				return false;
-		}
-	};
-
-	const getMenuItemMeta = (id) => {
-		const items = {
-			notes: { label: 'Notes', href: '/notes', iconType: 'note' },
-			workspace: { label: 'Workspace', href: '/workspace', iconType: 'workspace' },
-			automations: { label: 'Automations', href: '/automations', iconType: 'automations' },
-			calendar: { label: 'Calendar', href: '/calendar', iconType: 'calendar' },
-			playground: { label: 'Playground', href: '/playground', iconType: 'playground' }
-		};
-		return items[id];
-	};
+	$: isMenuItemVisible = (id) => isMenuItemVisibleFor(id, $config, $user);
 
 	const initPinnedMenuSortable = () => {
 		const el = document.getElementById('pinned-menu-items-list');
@@ -918,8 +881,8 @@
 									aria-label={$i18n.t(meta.label)}
 								>
 									<div class=" self-center flex items-center justify-center size-9">
-										{#if itemId === 'notes'}
-											<Note className="size-4.5" />
+										{#if itemId === 'knowledge'}
+											<BookOpen className="size-4.5" strokeWidth="1.5" />
 										{:else if itemId === 'workspace'}
 											<svg
 												xmlns="http://www.w3.org/2000/svg"
@@ -1167,8 +1130,8 @@
 										aria-label={$i18n.t(meta.label)}
 									>
 										<div class="self-center">
-											{#if itemId === 'notes'}
-												<Note className="size-4.5" strokeWidth="2" />
+											{#if itemId === 'knowledge'}
+												<BookOpen className="size-4.5" strokeWidth="1.5" />
 											{:else if itemId === 'workspace'}
 												<svg
 													xmlns="http://www.w3.org/2000/svg"

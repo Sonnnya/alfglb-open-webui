@@ -51,9 +51,16 @@ async def seed_registered_defaults():
 # master-expert carries expert's keys plus its own and no ranking logic exists
 # anywhere. That also means a tier can never take a capability away.
 #
-# Both bundles start empty: the tiers exist and membership is meaningful, but
-# they grant nothing beyond the defaults until a page is actually gated on a
-# key. Seeding is therefore a no-op for every current user's permissions.
+# Both bundles carry workspace.knowledge, which defaults to False for everyone
+# else — that single key is what puts «База знаний» in the menus for the tiers
+# and for admins, and nothing else. It gates *creating* a knowledge base
+# (routers/knowledge.py:279); reading one is governed by per-resource access
+# grants, so the button gates the door, not the data.
+#
+# The propose/approve split promised by the descriptions below is NOT expressed
+# here: approval is a state machine on the resource, not a permission boolean,
+# and needs its own schema. Adding `knowledge.propose` / `knowledge.approve`
+# later is additive and safe; renaming an existing key is not (see CLAUDE.md).
 EXPERT_GROUP_ID = 'expert'
 MASTER_EXPERT_GROUP_ID = 'master-expert'
 
@@ -66,13 +73,13 @@ TIER_GROUPS = {
     EXPERT_GROUP_ID: {
         'name': 'Эксперт',
         'description': 'Эксперт. Может предлагать (загружать) файлы, которые будут добавлены в базу знаний только после одобрения Мастером-экспертом. Системная группа - нельзя удалить.',
-        'permissions': {},
+        'permissions': {'workspace': {'knowledge': True}},
         'meta': {'system': True},
     },
     MASTER_EXPERT_GROUP_ID: {
         'name': 'Мастер-эксперт',
         'description': 'Мастер-эксперт. Может одобрять файлы (будут добавлены в базу знаний только после этого). Системная группа - нельзя удалить.',
-        'permissions': {},
+        'permissions': {'workspace': {'knowledge': True}},
         'meta': {'system': True},
     },
 }
@@ -2032,7 +2039,11 @@ AUTOMATION_MIN_INTERVAL = os.getenv('AUTOMATION_MIN_INTERVAL', '')
 
 AUTOMATION_AUTH_TOKEN_EXPIRES_IN = os.getenv('AUTOMATION_AUTH_TOKEN_EXPIRES_IN', '1h')
 
-ENABLE_NOTES = os.getenv('ENABLE_NOTES', 'True').lower() == 'true'
+# Notes is unused in this deployment; the Knowledge Base replaced it in both
+# menus. This only affects fresh installs: Config.get gives an existing
+# `notes.enable` DB row precedence, so on a database that has already booted
+# the admin toggle (Settings > General) is what turns it off.
+ENABLE_NOTES = os.getenv('ENABLE_NOTES', 'False').lower() == 'true'
 
 ENABLE_USER_STATUS = os.getenv('ENABLE_USER_STATUS', 'True').lower() == 'true'
 
