@@ -1,18 +1,14 @@
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
 import shutil
 import socket
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union
 from urllib.parse import urlparse
 
-import redis
 import requests
 from authlib.integrations.starlette_client import OAuth
 from pydantic import BaseModel
@@ -25,22 +21,65 @@ from open_webui.env import (
     FRONTEND_BUILD_DIR,
     OFFLINE_MODE,
     OPEN_WEBUI_DIR,
-    REDIS_KEY_PREFIX,
-    REDIS_SENTINEL_HOSTS,
-    REDIS_SENTINEL_PORT,
-    REDIS_URL,
     WEBUI_AUTH,
     WEBUI_FAVICON_URL,
     WEBUI_NAME,
     log,
 )
 from open_webui.models.config import Config
+from open_webui.models.groups import Groups
 
 
 async def seed_registered_defaults():
     await Config.rename_prefix('rag.web', 'web')
     await Config.repair_flattened_dict_configs()
     await Config.seed_defaults(DEFAULT_CONFIG)
+
+
+# ── Expert tiers ─────────────────────────────────────────────────────
+#
+# The two expert tiers are permission groups, not user.role values. An expert
+# is still role == 'user', so every existing role check keeps its current
+# meaning and no call site needs revisiting.
+#
+# The ids are literal and stable because seeding is keyed on the id (a rename
+# must not produce a duplicate on the next boot) and the frontend matches the
+# same two strings against the group_ids the admin user list already returns.
+# Keep them in sync with TIER_GROUPS in src/lib/constants.ts.
+#
+# The tiers are additive: get_permissions() OR-merges group permissions, so a
+# master-expert carries expert's keys plus its own and no ranking logic exists
+# anywhere. That also means a tier can never take a capability away.
+#
+# Both bundles start empty: the tiers exist and membership is meaningful, but
+# they grant nothing beyond the defaults until a page is actually gated on a
+# key. Seeding is therefore a no-op for every current user's permissions.
+EXPERT_GROUP_ID = 'expert'
+MASTER_EXPERT_GROUP_ID = 'master-expert'
+
+# Name and description are seeded straight into the DB and rendered raw by the
+# admin Groups UI (GroupItem.svelte renders {group.name} / {group.description}
+# with no t() wrapper), so they are NOT translatable through i18n — they carry
+# the language they were written in. This deployment is Russian, so they are
+# Russian. Admins can edit both from the group UI at any time.
+TIER_GROUPS = {
+    EXPERT_GROUP_ID: {
+        'name': 'Эксперт',
+        'description': 'Эксперт. Может предлагать (загружать) файлы, которые будут добавлены в базу знаний только после одобрения Мастером-экспертом. Системная группа - нельзя удалить.',
+        'permissions': {},
+        'meta': {'system': True},
+    },
+    MASTER_EXPERT_GROUP_ID: {
+        'name': 'Мастер-эксперт',
+        'description': 'Мастер-эксперт. Может одобрять файлы (будут добавлены в базу знаний только после этого). Системная группа - нельзя удалить.',
+        'permissions': {},
+        'meta': {'system': True},
+    },
+}
+
+
+async def seed_tier_groups():
+    await Groups.seed_defaults(TIER_GROUPS)
 
 
 async def async_reset_config():
@@ -83,7 +122,7 @@ async def import_legacy_config_json():
     """Migrate legacy config.json → database on first run."""
     if not os.path.exists(f'{DATA_DIR}/config.json'):
         return
-    with open(f'{DATA_DIR}/config.json', 'r') as _f:
+    with open(f'{DATA_DIR}/config.json') as _f:
         await Config.upsert(json.load(_f))
     os.rename(f'{DATA_DIR}/config.json', f'{DATA_DIR}/old_config.json')
 
@@ -100,14 +139,14 @@ try:
             if item.is_file() or item.is_symlink():
                 try:
                     item.unlink()
-                except Exception as e:
+                except Exception:
                     pass
-except Exception as e:
+except Exception:
     pass
 
 for file_path in (FRONTEND_BUILD_DIR / 'static').glob('**/*'):
     if file_path.is_file():
-        target_path = STATIC_DIR / file_path.relative_to((FRONTEND_BUILD_DIR / 'static'))
+        target_path = STATIC_DIR / file_path.relative_to(FRONTEND_BUILD_DIR / 'static')
         target_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             shutil.copyfile(file_path, target_path)
@@ -1142,7 +1181,7 @@ WEB_SEARCH_RESULT_COUNT = int(os.getenv('WEB_SEARCH_RESULT_COUNT', '3'))
 
 try:
     web_search_domain_filter_list = json.loads(os.getenv('WEB_SEARCH_DOMAIN_FILTER_LIST', '[]'))
-except Exception as e:
+except Exception:
     web_search_domain_filter_list = [
         # "wikipedia.com",
         # "wikimedia.org",
@@ -2697,8 +2736,8 @@ def load_oauth_providers():
             f'⚠️  OAuth providers configured ({provider_list}) but OPENID_PROVIDER_URL not set - logout will not work!'
         )
         log.warning(
-            f"Set OPENID_PROVIDER_URL to your OAuth provider's OpenID Connect discovery endpoint,"
-            f' or set OPENID_END_SESSION_ENDPOINT to a custom logout URL to fix logout functionality.'
+            "Set OPENID_PROVIDER_URL to your OAuth provider's OpenID Connect discovery endpoint,"
+            ' or set OPENID_END_SESSION_ENDPOINT to a custom logout URL to fix logout functionality.'
         )
 
 

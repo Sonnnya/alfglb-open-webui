@@ -13,6 +13,21 @@ export const AUDIO_API_BASE_URL = `${WEBUI_BASE_URL}/api/v1/audio`;
 export const IMAGES_API_BASE_URL = `${WEBUI_BASE_URL}/api/v1/images`;
 export const RETRIEVAL_API_BASE_URL = `${WEBUI_BASE_URL}/api/v1/retrieval`;
 
+// Expert tiers are permission groups, not user.role values — an expert is still
+// role === 'user'. The backend seeds these two groups at startup with these exact
+// ids; keep in sync with TIER_GROUPS in backend/open_webui/config.py.
+export const EXPERT_GROUP_ID = 'expert';
+export const MASTER_EXPERT_GROUP_ID = 'master-expert';
+
+// `label` is only a pre-fetch fallback. The displayed name is the seeded group's
+// own `name` from the API — database content, so it is already localised and no
+// i18n key exists for it. See the tier badge in admin/Users/UserList.svelte.
+export const TIER_GROUPS: { id: string; label: string }[] = [
+	// Most privileged first: a user in both tiers is labelled by the highest.
+	{ id: MASTER_EXPERT_GROUP_ID, label: 'Master Expert' },
+	{ id: EXPERT_GROUP_ID, label: 'Expert' }
+];
+
 // The version changes, but the promise must not. Let what
 // was built here keep its word across every release.
 export const WEBUI_VERSION = APP_VERSION;

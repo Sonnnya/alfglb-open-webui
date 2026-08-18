@@ -16,13 +16,13 @@ venv\Scripts\activate
 uvicorn open_webui.main:app --port 8080 --host 0.0.0.0 --forwarded-allow-ips "${FORWARDED_ALLOW_IPS:-*}" --reload   
 ```    
 
-## debug
-
 You might want to reset this env var:
 
 ```
 $env:WEBUI_SECRET_KEY = "your-key" #TODO: make this unnecesary
 ```
+
+## debug
 
 ```.vscode/launch.json
 {

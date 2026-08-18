@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import time
@@ -68,6 +69,19 @@ class GroupModel(BaseModel):
     updated_at: int  # timestamp in epoch
 
     model_config = ConfigDict(from_attributes=True)
+
+
+SYSTEM_GROUP_META_KEY = 'system'
+
+
+def is_system_group(group: Optional[GroupModel]) -> bool:
+    """True for groups seeded at startup, which must not be renamed or deleted.
+
+    Group has no is_system column, so the marker lives in the meta JSON. Neither
+    GroupForm nor GroupUpdateForm carries meta, so the group CRUD cannot set or
+    clear it — the marker is only ever written by the startup seeder.
+    """
+    return bool(group and (group.meta or {}).get(SYSTEM_GROUP_META_KEY))
 
 
 class GroupMember(Base):
@@ -141,6 +155,53 @@ class GroupTable:
         if 'share' not in group_data['data']['config']:
             group_data['data']['config']['share'] = DEFAULT_GROUP_SHARE_PERMISSION
         return group_data
+
+    async def seed_defaults(self, defaults: dict[str, dict], db: Optional[AsyncSession] = None) -> None:
+        """Insert group rows whose id doesn't yet exist in the DB.
+
+        Called at startup so system-defined groups are present without an admin
+        creating them by hand. Existing rows take precedence over defaults, so an
+        admin who retunes a seeded group keeps those edits across restarts.
+
+        Seeding is keyed on the id, never the name: renaming a seeded group must
+        not make the next boot insert a duplicate. Rows are built directly rather
+        than through insert_new_group, which mints its own uuid and drops meta.
+        """
+        async with get_async_db_context(db) as db:
+            result = await db.execute(select(Group.id).filter(Group.id.in_(defaults.keys())))
+            existing_ids = {row[0] for row in result.all()}
+
+            now = int(time.time())
+            new_groups = []
+            for group_id, group_data in defaults.items():
+                if group_id in existing_ids:
+                    continue
+                new_groups.append(
+                    Group(
+                        **{
+                            # Deep copy: _ensure_default_share_config mutates nested
+                            # dicts, and the caller's TIER_GROUPS is module-level.
+                            **self._ensure_default_share_config(copy.deepcopy(group_data)),
+                            'id': group_id,
+                            # Seeded at startup, so there is no admin to own them —
+                            # nothing reads group.user_id for display.
+                            'user_id': '',
+                            'created_at': now,
+                            'updated_at': now,
+                        }
+                    )
+                )
+
+            if not new_groups:
+                return
+
+            try:
+                db.add_all(new_groups)
+                await db.commit()
+                log.info('Seeded %d new default group(s): %s', len(new_groups), ', '.join(g.id for g in new_groups))
+            except Exception as e:
+                log.exception(e)
+                await db.rollback()
 
     async def insert_new_group(
         self, user_id: str, form_data: GroupForm, db: Optional[AsyncSession] = None

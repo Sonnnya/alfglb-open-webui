@@ -16,6 +16,7 @@ from open_webui.models.groups import (
     Groups,
     GroupUpdateForm,
     UserIdsForm,
+    is_system_group,
 )
 from open_webui.models.knowledge import Knowledges
 from open_webui.models.models import Models
@@ -186,6 +187,10 @@ async def update_group_by_id(
     db: AsyncSession = Depends(get_async_session),
 ):
     try:
+        # System groups are fully editable, including the name: seeding is keyed
+        # on the id and nothing resolves a tier by name, so a rename is only a
+        # display change — and renaming is how an admin localises a seeded tier.
+        # Only deletion is blocked; see delete_group_by_id.
         group = await Groups.update_group_by_id(id, form_data, db=db)
         if group:
             await publish_event(
@@ -306,6 +311,12 @@ async def delete_group_by_id(
     request: Request, id: str, user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)
 ):
     try:
+        if is_system_group(await Groups.get_group_by_id(id, db=db)):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=ERROR_MESSAGES.DEFAULT('System groups cannot be deleted'),
+            )
+
         result = await Groups.delete_group_by_id(id, db=db)
         if result:
             await publish_event(
