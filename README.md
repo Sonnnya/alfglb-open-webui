@@ -11,10 +11,10 @@ For backend follow this:
 ```
 cd backend
 uv venv --python 3.11
-uv pip install -r requirements.txt  
+uv pip install -r requirements.txt
 venv\Scripts\activate
-uvicorn open_webui.main:app --port 8080 --host 0.0.0.0 --forwarded-allow-ips "${FORWARDED_ALLOW_IPS:-*}" --reload   
-```    
+uvicorn open_webui.main:app --port 8080 --host 0.0.0.0 --forwarded-allow-ips "${FORWARDED_ALLOW_IPS:-*}" --reload
+```
 
 You might want to reset this env var:
 

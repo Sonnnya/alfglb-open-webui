@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { user } from '$lib/stores';
+	import { WELDING_KB_HREF } from '$lib/constants';
 	import { onMount } from 'svelte';
 
 	onMount(() => {
@@ -8,7 +9,10 @@
 			if ($user?.permissions?.workspace?.models) {
 				goto('/workspace/models');
 			} else if ($user?.permissions?.workspace?.knowledge) {
-				goto('/workspace/knowledge');
+				// Not '/workspace/knowledge' — that collections list is hidden in this
+				// build, and it is an expert's only workspace permission, so sending
+				// them there would be a dead end.
+				goto(WELDING_KB_HREF);
 			} else if ($user?.permissions?.workspace?.prompts) {
 				goto('/workspace/prompts');
 			} else if ($user?.permissions?.workspace?.tools) {

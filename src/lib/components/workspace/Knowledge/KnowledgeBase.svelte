@@ -48,11 +48,10 @@
 	} from '$lib/apis/knowledge';
 	import { processWeb, processYoutubeVideo } from '$lib/apis/retrieval';
 
-	import { blobToFile, isYoutubeUrl, copyToClipboard } from '$lib/utils';
+	import { blobToFile, isYoutubeUrl } from '$lib/utils';
 	import { computeFileHash } from '$lib/utils/hash';
 
 	import Spinner from '$lib/components/common/Spinner.svelte';
-	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Files from './KnowledgeBase/Files.svelte';
 	import DocumentRegistry from './KnowledgeBase/DocumentRegistry.svelte';
 
@@ -140,6 +139,12 @@
 	let documentRegistry: { refresh: () => void } | null = null;
 	let fileItems = null;
 	let fileItemsTotal = null;
+
+	// Files still uploading, handed to the registry so it can show a row with a
+	// spinner. Two sources already feed fileItems with status 'uploading': the
+	// optimistic placeholder uploadFileHandler prepends, and the /files/pending
+	// merge in getItemsPage (embedding still running). Both belong here.
+	$: uploadingItems = (fileItems ?? []).filter((item) => item?.status === 'uploading');
 
 	// Directory state
 	let currentDirectoryId: string | null = null;
@@ -1134,7 +1139,10 @@
 			}
 			knowledgeId = knowledge?.id;
 		} else {
-			goto('/workspace/knowledge');
+			// Home, not '/workspace/knowledge': that route now bounces to
+			// WELDING_KB_HREF, which is the base that just failed to load — the two
+			// would ping-pong forever.
+			goto('/');
 		}
 
 		const dropZone = document.querySelector('body');
@@ -1202,11 +1210,13 @@
 	}}
 />
 
+<!-- Single-file on purpose: one knowledge document is one file, and the picker is
+     now reached straight from «Загрузить новый документ». Dropping several files
+     still works and still makes one document each — the loop below is unchanged. -->
 <input
 	id="files-input"
 	bind:files={inputFiles}
 	type="file"
-	multiple
 	hidden
 	on:change={async () => {
 		if (inputFiles && inputFiles.length > 0) {
@@ -1309,20 +1319,6 @@
 								changeDebounceHandler();
 							}}
 						/>
-
-						<div class="hidden md:block">
-							<Tooltip content={$i18n.t('Click to copy ID')}>
-								<button
-									class="text-xs text-gray-500 font-mono shrink-0 px-2 py-1 rounded-lg cursor-pointer hover:underline transition whitespace-nowrap"
-									on:click={() => {
-										copyToClipboard(id);
-										toast.success($i18n.t('ID copied to clipboard'));
-									}}
-								>
-									{id}
-								</button>
-							</Tooltip>
-						</div>
 					</div>
 				</div>
 			</div>
@@ -1410,8 +1406,8 @@
 							class=" w-full text-sm pr-4 py-1 rounded-r-xl outline-hidden bg-transparent"
 							bind:value={query}
 							on:input={handleSearchInput}
-							aria-label={$i18n.t('Search Collection')}
-							placeholder={$i18n.t('Search Collection')}
+							aria-label={$i18n.t('Search Documents')}
+							placeholder={$i18n.t('Search Documents')}
 							on:focus={() => {
 								selectedFileId = null;
 								selectedFile = null;
@@ -1420,36 +1416,43 @@
 							}}
 						/>
 
-						<Dropdown align="end">
-							<button
-								class="p-1.5 mr-1 rounded-xl text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800 transition"
-								type="button"
-							>
-								<AdjustmentsHorizontal className="size-3.5" strokeWidth="2" />
-							</button>
-
-							<div slot="content">
-								<div
-									class="min-w-[180px] rounded-2xl px-1 py-1 border border-gray-100 dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg"
+						<!-- «Содержимое файла» search toggle hidden in this build: the registry is a
+						     flat document list, and matching inside file text produced hits with no row
+						     to attach them to. The block below is LEFT IN PLACE and still compiles — the
+						     `includeContent` flag it drives is still sent with every search, just always
+						     false. To bring it back, change the {#if false} to {#if true}. -->
+						{#if false}
+							<Dropdown align="end">
+								<button
+									class="p-1.5 mr-1 rounded-xl text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800 transition"
+									type="button"
 								>
-									<button
-										class="select-none flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl w-full"
-										type="button"
-										on:click={() => {
-											includeContent = !includeContent;
-										}}
+									<AdjustmentsHorizontal className="size-3.5" strokeWidth="2" />
+								</button>
+
+								<div slot="content">
+									<div
+										class="min-w-[180px] rounded-2xl px-1 py-1 border border-gray-100 dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg"
 									>
-										<Checkbox
-											state={includeContent ? 'checked' : 'unchecked'}
-											on:change={(e) => {
-												includeContent = e.detail === 'checked';
+										<button
+											class="select-none flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl w-full"
+											type="button"
+											on:click={() => {
+												includeContent = !includeContent;
 											}}
-										/>
-										{$i18n.t('File content')}
-									</button>
+										>
+											<Checkbox
+												state={includeContent ? 'checked' : 'unchecked'}
+												on:change={(e) => {
+													includeContent = e.detail === 'checked';
+												}}
+											/>
+											{$i18n.t('File content')}
+										</button>
+									</div>
 								</div>
-							</div>
-						</Dropdown>
+							</Dropdown>
+						{/if}
 
 						{#if knowledge?.write_access}
 							<div>
@@ -1575,6 +1578,9 @@
 												bind:this={documentRegistry}
 												knowledgeId={knowledge.id}
 												canReview={canReviewVersions}
+												canUpload={knowledge?.write_access ?? false}
+												{query}
+												uploading={uploadingItems}
 											/>
 										</div>
 									{:else}

@@ -1,5 +1,7 @@
 <script lang="ts">
 	import { getContext, createEventDispatcher } from 'svelte';
+	import type { Writable } from 'svelte/store';
+	import type { i18n as i18nType } from 'i18next';
 	const dispatch = createEventDispatcher();
 
 	import Dropdown from '$lib/components/common/Dropdown.svelte';
@@ -13,12 +15,14 @@
 	import GarbageBin from '$lib/components/icons/GarbageBin.svelte';
 	import ArrowUturnLeft from '$lib/components/icons/ArrowUturnLeft.svelte';
 
-	const i18n = getContext('i18n');
+	// Typed rather than the bare getContext('i18n') used elsewhere: untyped, every
+	// $i18n.t() call in this file raises "Cannot use 'i18n' as a store".
+	const i18n = getContext<Writable<i18nType>>('i18n');
 
 	export let onClose: Function = () => {};
 
 	export let onSync: Function = () => {};
-	export let onUpload: Function = (data) => {};
+	export let onUpload: Function = (data: { type: string }) => {};
 	export let onReset: Function = () => {};
 
 	let show = false;
@@ -33,26 +37,30 @@
 	}}
 	align="end"
 >
-	<Tooltip content={$i18n.t('Add Content')}>
-		<button
-			class=" p-1.5 rounded-xl hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 transition font-medium text-sm flex items-center space-x-1"
-			on:click={(e) => {
-				e.stopPropagation();
-				show = true;
-			}}
-		>
-			<svg
-				xmlns="http://www.w3.org/2000/svg"
-				viewBox="0 0 16 16"
-				fill="currentColor"
-				class="w-4 h-4"
-			>
-				<path
-					d="M8.75 3.75a.75.75 0 0 0-1.5 0v3.5h-3.5a.75.75 0 0 0 0 1.5h3.5v3.5a.75.75 0 0 0 1.5 0v-3.5h3.5a.75.75 0 0 0 0-1.5h-3.5v-3.5Z"
-				/>
-			</svg>
-		</button>
-	</Tooltip>
+	<!-- A labelled primary button rather than the upstream bare «+»: adding a
+	     document is the main thing anyone does on this screen, and a lone plus
+	     icon read as decoration.
+	
+	     It fires «Загрузить файлы» DIRECTLY instead of opening the dropdown. A
+	     knowledge document is one file, so the other entries — directories, sync,
+	     webpages, plain text — have no meaning in this deployment. The whole
+	     <div slot="content"> below is deliberately LEFT IN PLACE and still
+	     compiles, but `show` is never set true any more, so the menu is
+	     unreachable. To bring it back, restore `show = true` here. -->
+	<button
+		class="px-3 py-1.5 rounded-xl bg-black text-white dark:bg-white dark:text-black hover:opacity-90 transition font-medium text-sm flex items-center gap-1.5 shrink-0"
+		on:click={(e) => {
+			e.stopPropagation();
+			onUpload({ type: 'files' });
+		}}
+	>
+		<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="w-4 h-4">
+			<path
+				d="M8.75 3.75a.75.75 0 0 0-1.5 0v3.5h-3.5a.75.75 0 0 0 0 1.5h3.5v3.5a.75.75 0 0 0 1.5 0v-3.5h3.5a.75.75 0 0 0 0-1.5h-3.5v-3.5Z"
+			/>
+		</svg>
+		<span class="whitespace-nowrap">{$i18n.t('Upload new document')}</span>
+	</button>
 
 	<div slot="content">
 		<div

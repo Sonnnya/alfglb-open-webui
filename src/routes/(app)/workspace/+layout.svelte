@@ -11,6 +11,7 @@
 		tools
 	} from '$lib/stores';
 	import { page } from '$app/stores';
+	import { WELDING_KB_HREF } from '$lib/constants';
 	import { goto } from '$app/navigation';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Sidebar from '$lib/components/icons/Sidebar.svelte';
@@ -21,7 +22,16 @@
 
 	onMount(async () => {
 		if ($user?.role !== 'admin') {
-			if ($page.url.pathname.includes('/models') && !$user?.permissions?.workspace?.models) {
+			// Workspace is admin-only in this build (mirrors isMenuItemVisible in
+			// src/lib/utils/menu-items.ts, which stops drawing the menu entry) with
+			// ONE exception: the seeded knowledge base. It lives at
+			// /workspace/knowledge/{id}, i.e. under this very layout, so a blanket
+			// redirect here would lock every Эксперт out of the only screen the tier
+			// exists for. The upstream per-tab checks below are kept intact for that
+			// path and for if this is ever relaxed.
+			if (!$page.url.pathname.startsWith(WELDING_KB_HREF)) {
+				goto('/');
+			} else if ($page.url.pathname.includes('/models') && !$user?.permissions?.workspace?.models) {
 				goto('/');
 			} else if (
 				$page.url.pathname.includes('/knowledge') &&
@@ -80,7 +90,17 @@
 					</div>
 				{/if}
 
-				<div class="">
+				<!-- No tab strip on the knowledge base screen, for anyone including admins:
+				     «База знаний» is its own destination reached straight from the main menu,
+				     and Модели / Промпты / Скиллы sitting above it made it read as a
+				     Workspace tab that had lost its own tab. Elsewhere under /workspace the
+				     strip is admin-only — the only non-admin who reaches this layout is an
+				     Эксперт, and every tab they could see is gone. -->
+				<div
+					class={$user?.role === 'admin' && !$page.url.pathname.startsWith(WELDING_KB_HREF)
+						? ''
+						: 'hidden'}
+				>
 					<div
 						class="flex gap-1 scrollbar-none overflow-x-auto w-fit text-center text-sm font-medium rounded-full bg-transparent py-1 touch-auto pointer-events-auto"
 					>
@@ -95,18 +115,10 @@
 							>
 						{/if}
 
-						{#if $user?.role === 'admin' || $user?.permissions?.workspace?.knowledge}
-							<a
-								draggable="false"
-								aria-current={$page.url.pathname.includes('/workspace/knowledge') ? 'page' : null}
-								class="min-w-fit p-1.5 {$page.url.pathname.includes('/workspace/knowledge')
-									? ''
-									: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition select-none"
-								href="/workspace/knowledge"
-							>
-								{$i18n.t('Knowledge')}
-							</a>
-						{/if}
+						<!-- «Knowledge» tab intentionally removed from this build: the deployment has
+						     one knowledge base, and «База знаний» in the main menu goes straight to it
+						     (WELDING_KB_HREF). The /workspace/knowledge route still exists and still
+						     compiles — see the guard in its +page.svelte. -->
 
 						{#if $user?.role === 'admin' || $user?.permissions?.workspace?.prompts}
 							<a

@@ -30,6 +30,7 @@ from open_webui.models.knowledge import (
     KnowledgeUserResponse,
     KnowledgeDocumentListResponse,
     KnowledgeFileVersionModel,
+    KnowledgeVersionResponse,
     VERSION_STATUS_APPROVED,
     VERSION_STATUS_PENDING,
     VERSION_STATUS_REJECTED,
@@ -38,6 +39,7 @@ from open_webui.models.knowledge import (
 from open_webui.models.models import ModelForm, Models
 from open_webui.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
 from open_webui.retrieval.external import retrieve_external_knowledge, retrieve_external_knowledge_for_connection
+from open_webui.routers.files import build_file_content_response
 from open_webui.routers.retrieval import (
     BatchProcessFilesForm,
     ProcessFileForm,
@@ -60,6 +62,13 @@ router = APIRouter()
 ############################
 
 PAGE_ITEM_COUNT = 30
+
+# The document registry pages smaller than the other listings: its rows are tall
+# (filename, status, author, actions, an expandable history) and the screen is the
+# only one most users ever see. Keep in sync with PER_PAGE in
+# src/lib/components/workspace/Knowledge/KnowledgeBase/DocumentRegistry.svelte —
+# the component decides whether to draw the pager from its own copy.
+DOCUMENT_REGISTRY_PAGE_COUNT = 10
 
 ############################
 # Knowledge Base Embedding
@@ -2492,7 +2501,7 @@ async def _load_version_in_kb(id: str, version_id: str, db: AsyncSession):
     return version, document
 
 
-@router.get('/{id}/document/{document_id}/versions', response_model=list[KnowledgeFileVersionModel])
+@router.get('/{id}/document/{document_id}/versions', response_model=list[KnowledgeVersionResponse])
 async def get_document_versions(
     id: str,
     document_id: str,
@@ -2550,6 +2559,124 @@ async def get_version_content(
         'content': (file.data or {}).get('content', ''),
         'version': version.model_dump(),
     }
+
+
+@router.get('/{id}/version/{version_id}/download')
+async def download_version(
+    id: str,
+    version_id: str,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Download the actual bytes of any revision, published or not.
+
+    Same reason /content authorises on the knowledge base rather than the file:
+    an unapproved version has no knowledge_file row, so has_access_to_file cannot
+    resolve it and /files/{id}/content would 404 for everyone but the uploader.
+    """
+    await _load_kb_for(id, user, 'read', db)
+    version, _document = await _load_version_in_kb(id, version_id, db)
+
+    file = await Files.get_file_by_id(version.file_id, db=db)
+    if not file:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    return await build_file_content_response(file, attachment=True)
+
+
+@router.delete('/{id}/version/{version_id}', response_model=dict)
+async def delete_knowledge_version(
+    request: Request,
+    id: str,
+    version_id: str,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Delete a single revision, leaving the rest of the document's history intact.
+
+    Narrower than DELETE /{id}/document/{document_id}, and the rights differ to
+    match: an Эксперт may withdraw **a version they authored** — the case this
+    exists for — while a Мастер-эксперт or admin may remove anyone's.
+
+    The **published** version is refused. Removing it would leave the document
+    pointing at nothing while its chunks stayed in the collection, and there is
+    already a control for that outcome («Удалить всю цепочку»).
+
+    Deleting the last remaining version takes the document with it: a
+    knowledge_file with no versions and no published file renders as nothing but
+    still occupies the table. The response says which happened so the registry
+    knows whether to drop the row or just reload its history.
+    """
+    knowledge = await _load_kb_for(id, user, 'write', db)
+    if is_external_knowledge(knowledge):
+        external_knowledge_error()
+
+    version, document = await _load_version_in_kb(id, version_id, db)
+
+    if version.author_id != user.id and not await _may_review(user, db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
+
+    # Deleting the published version is refused only while *other* versions
+    # remain — that is the case that would leave the document pointing at
+    # nothing while its chunks stayed in the collection. When it is the sole
+    # version there is no such gap: the document is removed with it below, and
+    # every chunk goes too. Most documents here have exactly one approved
+    # version, so refusing outright left them with no per-version control at all.
+    is_sole_version = len(await Knowledges.get_versions(document.id, db=db)) <= 1
+
+    if document.file_id and document.file_id == version.file_id and not is_sole_version:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            # Plain string, not ERROR_MESSAGES.DEFAULT — that wraps the text in
+            # "[ERROR: ...]", which the frontend shows verbatim in a toast.
+            detail=(
+                'Опубликованную версию нельзя удалить по отдельности. '
+                'Удалите весь документ или дождитесь публикации другой версии.'
+            ),
+        )
+
+    remaining = await Knowledges.delete_version(version_id, db=db)
+    if remaining < 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    deleted_document = False
+    orphaned_file_ids: list[str] = []
+    if remaining == 0:
+        # Returns whatever files the document still referenced — normally just the
+        # published one, which is this version's file, but take the list so a
+        # document repaired by hand cannot leave chunks behind.
+        orphaned_file_ids = await Knowledges.delete_document(document.id, db=db)
+        deleted_document = True
+
+    # Belt and braces. An unpublished version should own no chunks in the KB
+    # collection — _publish_version drops the outgoing file's chunks before
+    # adding the incoming one — but a publish interrupted midway would leave
+    # some, and they would then be unreachable by any other cleanup.
+    for file_id in dict.fromkeys([version.file_id, *orphaned_file_ids]):
+        try:
+            await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=knowledge.id, filter={'file_id': file_id})
+        except Exception as e:
+            log.debug(f'No chunks to drop for {file_id}: {e}')
+
+    file = await Files.get_file_by_id(version.file_id, db=db)
+    if file and (file.user_id == user.id or user.role == 'admin'):
+        try:
+            file_collection = f'file-{version.file_id}'
+            if await ASYNC_VECTOR_DB_CLIENT.has_collection(collection_name=file_collection):
+                await ASYNC_VECTOR_DB_CLIENT.delete_collection(collection_name=file_collection)
+        except Exception as e:
+            log.debug(f'No per-file collection for {version.file_id}: {e}')
+
+        await Files.delete_file_by_id(version.file_id, db=db)
+
+    await publish_event(
+        request,
+        EVENTS.KNOWLEDGE_FILE_REMOVED,
+        actor=user,
+        subject_id=version.file_id,
+        data={'knowledge_id': knowledge.id, 'document_id': document.id, 'version_id': version_id},
+    )
+    return {'deleted_document': deleted_document}
 
 
 @router.post('/{id}/version/{version_id}/approve', response_model=KnowledgeFileVersionModel)
@@ -2618,6 +2745,75 @@ async def reject_version(
     )
 
 
+@router.delete('/{id}/document/{document_id}', response_model=bool)
+async def delete_knowledge_document(
+    request: Request,
+    id: str,
+    document_id: str,
+    delete_files: bool = Query(True),
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Remove a document and its whole version history from the knowledge base.
+
+    Ownership follows the document, not the latest version: an Эксперт may delete
+    what they created, a Мастер-эксперт (or an admin) may delete anyone's. That
+    matters because deleting takes the history with it — letting the author of a
+    single later version delete the document would hand them everyone else's
+    revisions too.
+
+    Distinct from POST /{id}/file/remove, which is keyed on a *published* file_id
+    and so cannot reach a document that has never been approved.
+    """
+    knowledge = await _load_kb_for(id, user, 'write', db)
+    if is_external_knowledge(knowledge):
+        external_knowledge_error()
+
+    document = await Knowledges.get_document_by_id(document_id, db=db)
+    if not document or document.knowledge_id != id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    if document.user_id != user.id and not await _may_review(user, db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
+
+    file_ids = await Knowledges.delete_document(document_id, db=db)
+
+    for file_id in file_ids:
+        # By file_id only — never by hash. See the note in /{id}/file/remove.
+        try:
+            await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=knowledge.id, filter={'file_id': file_id})
+        except Exception as e:
+            log.debug(f'No chunks to drop for {file_id}: {e}')
+
+        if not delete_files:
+            continue
+
+        # Same rule /{id}/file/remove applies: drop the underlying file only when
+        # it is the caller's own (or they are an admin). A Мастер-эксперт deleting
+        # someone else's document detaches it without destroying their file.
+        file = await Files.get_file_by_id(file_id, db=db)
+        if not file or not (file.user_id == user.id or user.role == 'admin'):
+            continue
+
+        try:
+            file_collection = f'file-{file_id}'
+            if await ASYNC_VECTOR_DB_CLIENT.has_collection(collection_name=file_collection):
+                await ASYNC_VECTOR_DB_CLIENT.delete_collection(collection_name=file_collection)
+        except Exception as e:
+            log.debug(f'No per-file collection for {file_id}: {e}')
+
+        await Files.delete_file_by_id(file_id, db=db)
+
+    await publish_event(
+        request,
+        EVENTS.KNOWLEDGE_FILE_REMOVED,
+        actor=user,
+        subject_id=document_id,
+        data={'knowledge_id': knowledge.id, 'document_id': document_id},
+    )
+    return True
+
+
 @router.get('/{id}/documents', response_model=KnowledgeDocumentListResponse)
 async def get_knowledge_documents(
     id: str,
@@ -2645,7 +2841,7 @@ async def get_knowledge_documents(
     if user.role == 'admin' and limit is not None:
         limit = max(1, limit)
     else:
-        limit = PAGE_ITEM_COUNT
+        limit = DOCUMENT_REGISTRY_PAGE_COUNT
 
     filter: dict = {}
     if query:

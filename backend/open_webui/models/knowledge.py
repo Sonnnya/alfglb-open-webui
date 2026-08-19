@@ -207,6 +207,34 @@ class KnowledgeFileVersionModel(BaseModel):
     created_at: int
 
 
+class KnowledgeVersionResponse(KnowledgeFileVersionModel):
+    """One «История» row: the version plus the two people attached to it.
+
+    Two distinct roles, and the UI shows them next to different text: `author`
+    wrote `comment` (their changelog for the revision), `reviewer` wrote
+    `review_note` (why it was approved or rejected). Both are Optional — a
+    pending version has no reviewer yet, and either user row can be deleted
+    out from under the version.
+    """
+
+    author: Optional[UserResponse] = None
+    reviewer: Optional[UserResponse] = None
+
+    # The stored file's own name, so «История» can show what was actually
+    # uploaded for each revision — versions of one document routinely differ.
+    # None when the file row is gone (see delete_version) rather than absent, so
+    # a stale row still renders instead of vanishing from the history.
+    filename: Optional[str] = None
+
+    # True for the one revision the document currently points at, i.e. the one
+    # the model retrieves. Computed here because nothing else on the wire can
+    # express it: KnowledgeDocumentResponse.is_published describes only the
+    # *latest* version, so with an approved v1 and a pending v2 the client has no
+    # way to tell that v1 is the live one. The per-version delete button keys on
+    # this — the published revision cannot be deleted on its own.
+    is_published: bool = False
+
+
 class KnowledgeDirectoryModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -280,6 +308,11 @@ class KnowledgeDocumentResponse(BaseModel):
     review_note: Optional[str] = None
 
     author: Optional[UserResponse] = None
+    # Who created the *document*. Deliberately not the same as `author`, which is
+    # the latest version's uploader: once someone proposes a version on another
+    # person's document the two diverge, and delete rights follow the owner. The
+    # UI needs this to decide whether to offer «Удалить» at all.
+    owner_id: str
     # True when this exact version is the one the model can retrieve.
     is_published: bool = False
     created_at: int
@@ -991,6 +1024,7 @@ class KnowledgeTable:
                         comment=ver.comment if ver else None,
                         review_note=ver.review_note if ver else None,
                         author=(UserResponse(**UserModel.model_validate(author).model_dump()) if author else None),
+                        owner_id=document.user_id,
                         is_published=bool(document.file_id) and document.file_id == (ver.file_id if ver else file.id),
                         created_at=ver.created_at if ver else document.created_at,
                         updated_at=document.updated_at,
@@ -1101,15 +1135,39 @@ class KnowledgeTable:
 
     async def get_versions(
         self, knowledge_file_id: str, db: Optional[AsyncSession] = None
-    ) -> list[KnowledgeFileVersionModel]:
-        """Full history, newest version first — what «История» renders."""
+    ) -> list[KnowledgeVersionResponse]:
+        """Full history, newest version first — what «История» renders.
+
+        Both user joins are OUTER, and the reviewer one especially: a pending
+        version has reviewed_by = NULL, so an inner join would drop exactly the
+        rows the reviewer is looking for. Same failure mode that once hid every
+        versionless document from the registry.
+        """
         async with get_async_db_context(db) as db:
+            author = aliased(User)
+            reviewer = aliased(User)
+            published_file_id = (
+                await db.execute(select(KnowledgeFile.file_id).filter_by(id=knowledge_file_id))
+            ).scalar()
+
             result = await db.execute(
-                select(KnowledgeFileVersion)
+                select(KnowledgeFileVersion, author, reviewer, File.filename)
+                .outerjoin(author, author.id == KnowledgeFileVersion.author_id)
+                .outerjoin(reviewer, reviewer.id == KnowledgeFileVersion.reviewed_by)
+                .outerjoin(File, File.id == KnowledgeFileVersion.file_id)
                 .filter(KnowledgeFileVersion.knowledge_file_id == knowledge_file_id)
                 .order_by(KnowledgeFileVersion.version_no.desc())
             )
-            return [KnowledgeFileVersionModel.model_validate(v) for v in result.scalars().all()]
+            return [
+                KnowledgeVersionResponse(
+                    **KnowledgeFileVersionModel.model_validate(version).model_dump(),
+                    author=(UserResponse(**UserModel.model_validate(a).model_dump()) if a else None),
+                    reviewer=(UserResponse(**UserModel.model_validate(r).model_dump()) if r else None),
+                    filename=filename,
+                    is_published=bool(published_file_id) and version.file_id == published_file_id,
+                )
+                for version, a, r, filename in result.all()
+            ]
 
     async def get_version_by_id(
         self, version_id: str, db: Optional[AsyncSession] = None
@@ -1248,6 +1306,67 @@ class KnowledgeTable:
                 return True
         except Exception:
             return False
+
+    async def delete_document(self, document_id: str, db: Optional[AsyncSession] = None) -> list[str]:
+        """Delete a document and its entire version history.
+
+        Returns every file_id that was attached to it — published, pending and
+        rejected alike — so the caller can clear the matching vector chunks. The
+        file rows themselves are left to the caller, which applies its own
+        ownership rule to them.
+
+        Version rows are removed explicitly rather than left to the
+        ondelete='CASCADE' on knowledge_file_version.knowledge_file_id: SQLite
+        honours that only with PRAGMA foreign_keys ON, so relying on it would
+        behave differently in dev and in the Postgres deployment.
+        """
+        async with get_async_db_context(db) as db:
+            document = (await db.execute(select(KnowledgeFile).filter_by(id=document_id))).scalars().first()
+            if not document:
+                return []
+
+            version_files = (
+                (await db.execute(select(KnowledgeFileVersion.file_id).filter_by(knowledge_file_id=document_id)))
+                .scalars()
+                .all()
+            )
+
+            # dict.fromkeys: de-duplicate while keeping order — the published
+            # file_id is normally also one of the version rows.
+            file_ids = list(
+                dict.fromkeys([fid for fid in version_files if fid] + ([document.file_id] if document.file_id else []))
+            )
+
+            await db.execute(delete(KnowledgeFileVersion).filter_by(knowledge_file_id=document_id))
+            await db.execute(delete(KnowledgeFile).filter_by(id=document_id))
+            await db.commit()
+            return file_ids
+
+    async def delete_version(self, version_id: str, db: Optional[AsyncSession] = None) -> int:
+        """Delete one version row. Returns how many versions the document has left.
+
+        A count of 0 means the caller should remove the document too — a
+        knowledge_file with no versions and no published file renders as nothing
+        (search_documents_by_id skips rows with no file) but keeps occupying the
+        table.
+        """
+        async with get_async_db_context(db) as db:
+            version = (await db.execute(select(KnowledgeFileVersion).filter_by(id=version_id))).scalars().first()
+            if not version:
+                return -1
+
+            document_id = version.knowledge_file_id
+            await db.execute(delete(KnowledgeFileVersion).filter_by(id=version_id))
+            await db.commit()
+
+            remaining = (
+                await db.execute(
+                    select(func.count())
+                    .select_from(KnowledgeFileVersion)
+                    .filter(KnowledgeFileVersion.knowledge_file_id == document_id)
+                )
+            ).scalar() or 0
+            return remaining
 
     async def reset_knowledge_by_id(
         self, id: str, include_directories: bool = True, db: Optional[AsyncSession] = None

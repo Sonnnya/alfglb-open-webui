@@ -18,16 +18,22 @@
 
 	import { WEBUI_API_BASE_URL } from '$lib/constants';
 	import {
+		addFileToKnowledgeById,
 		approveVersion,
+		deleteKnowledgeDocument,
+		deleteKnowledgeVersion,
 		getDocumentVersions,
 		getKnowledgeDocuments,
 		rejectVersion
 	} from '$lib/apis/knowledge';
+	import { uploadFile } from '$lib/apis/files';
+	import { user } from '$lib/stores';
 
+	import ConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	import Pagination from '$lib/components/common/Pagination.svelte';
+	import VersionReviewForm from './VersionReviewForm.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Badge from '$lib/components/common/Badge.svelte';
-	import Search from '$lib/components/icons/Search.svelte';
 	import DocumentPage from '$lib/components/icons/DocumentPage.svelte';
 
 	// Typed rather than the bare getContext('i18n') used elsewhere: untyped, every
@@ -37,13 +43,32 @@
 	export let knowledgeId: string;
 	/** Whether the viewer may approve or reject — a Мастер-эксперт or an admin. */
 	export let canReview = false;
+	/** Whether the viewer may propose a new version — anyone with write access. */
+	export let canUpload = false;
+	/**
+	 * Files the parent is currently uploading, rendered above the list with a
+	 * spinner. They have no document row yet — the registry would otherwise show
+	 * nothing at all between picking a file and the upload finishing, which read
+	 * as the app having ignored the click.
+	 */
+	export let uploading: any[] = [];
+	/**
+	 * Search text, owned by the parent's toolbar.
+	 *
+	 * The registry used to carry its own input, which left two search boxes on
+	 * one screen — the collection search above (meaningless with a single
+	 * knowledge base) and this one. The parent's box now drives this instead.
+	 */
+	export let query = '';
 
-	const PER_PAGE = 30;
+	// Must match DOCUMENT_REGISTRY_PAGE_COUNT in backend/open_webui/routers/knowledge.py —
+	// the server decides how many rows come back, this only decides whether to draw
+	// the pager, so a mismatch hides it while pages still exist.
+	const PER_PAGE = 10;
 
 	let documents: any[] = [];
 	let total = 0;
 	let page = 1;
-	let query = '';
 	let loading = true;
 
 	// document_id -> versions, loaded lazily when «История» is expanded
@@ -74,13 +99,22 @@
 	// just uploaded would not appear until a full page reload.
 	export const refresh = () => load();
 
-	const onSearchInput = () => {
+	// Debounced here rather than in the parent: the parent's handler also refetches
+	// the legacy /files list, and the two want different timing.
+	let appliedQuery = query;
+	$: if (query !== appliedQuery) {
+		appliedQuery = query;
 		clearTimeout(searchDebounce);
 		searchDebounce = setTimeout(() => {
-			page = 1;
-			load();
+			// Assigning page triggers the reactive load below; when already on the
+			// first page that assignment is a no-op, so load explicitly.
+			if (page !== 1) {
+				page = 1;
+			} else {
+				load();
+			}
 		}, 300);
-	};
+	}
 
 	const toggleHistory = async (documentId: string) => {
 		if (expanded[documentId] !== undefined) {
@@ -99,14 +133,162 @@
 		expanded = { ...expanded, [documentId]: versions ?? [] };
 	};
 
-	// document_id of the row whose review form is open, if any. Only one at a time
-	// — reviewing is a deliberate act, not something to fan out across the list.
+	// ── New version upload ────────────────────────────────────────────────
+	//
+	// Deliberately a two-step flow rather than the parent's single uploadFile()
+	// with metadata.knowledge_id: that metadata makes routers/files.py auto-link
+	// the file as a *new* document. A version has to name the document it belongs
+	// to, which only POST /knowledge/{id}/file/add accepts.
+	//
+	// uploadFile() with its default stream=true returns only once the file's
+	// process status is completed or failed, so /file/add — which rejects an
+	// unprocessed file — is safe to call straight after.
+	let versionInput: HTMLInputElement;
+	let versionTargetId: string | null = null;
+	let uploadingId: string | null = null;
+
+	const pickNewVersion = (documentId: string) => {
+		versionTargetId = documentId;
+		versionInput.value = '';
+		versionInput.click();
+	};
+
+	const onVersionPicked = async (e: Event) => {
+		const file = (e.target as HTMLInputElement).files?.[0];
+		const documentId = versionTargetId;
+		versionTargetId = null;
+		if (!file || !documentId) return;
+
+		if (file.size === 0) {
+			toast.error($i18n.t('You cannot upload an empty file.'));
+			return;
+		}
+
+		uploadingId = documentId;
+		try {
+			const uploaded = await uploadFile(localStorage.token, file);
+			if (!uploaded) {
+				toast.error($i18n.t('Failed to upload file.'));
+				return;
+			}
+			if (uploaded.error) {
+				toast.error(`${uploaded.error}`);
+				return;
+			}
+
+			await addFileToKnowledgeById(localStorage.token, knowledgeId, uploaded.id, null, {
+				documentId
+			});
+
+			toast.success($i18n.t('Pending review'));
+			delete expanded[documentId];
+			await load();
+		} catch (err) {
+			toast.error(`${err}`);
+		} finally {
+			uploadingId = null;
+		}
+	};
+
+	// ── Delete ────────────────────────────────────────────────────────────
+	//
+	// Deleting takes the document's whole version history with it, so the right
+	// to do it follows the document's OWNER (owner_id), not the latest version's
+	// author — those diverge as soon as someone proposes a version on another
+	// person's document. A Мастер-эксперт may delete anyone's; the backend
+	// enforces the same rule, this only decides whether to draw the button.
+	let confirmDeleteId: string | null = null;
+	let deleting = false;
+
+	const mayDelete = (doc: any) => canReview || doc.owner_id === $user?.id;
+
+	const confirmDelete = async () => {
+		const documentId = confirmDeleteId;
+		if (!documentId || deleting) return;
+
+		deleting = true;
+		const res = await deleteKnowledgeDocument(localStorage.token, knowledgeId, documentId).catch(
+			(e) => {
+				toast.error(`${e}`);
+				return null;
+			}
+		);
+		deleting = false;
+		confirmDeleteId = null;
+
+		if (res) {
+			toast.success($i18n.t('Deleted'));
+			delete expanded[documentId];
+			// Deleting the last row of a page would otherwise leave an empty view.
+			if (documents.length === 1 && page > 1) {
+				page -= 1;
+			} else {
+				await load();
+			}
+		}
+	};
+
+	// ── Per-version delete ────────────────────────────────────────────────
+	//
+	// Narrower than the document delete above, and keyed on a different person:
+	// this is an Эксперт withdrawing a version *they* authored, so the rule is
+	// author_id, not owner_id. Reviewers may remove anyone's. The backend refuses
+	// the published version outright — the button isn't drawn for it either.
+	let confirmVersion: { documentId: string; version: any } | null = null;
+	let deletingVersion = false;
+
+	// version.is_published comes from the backend, which compares the version's
+	// file against the document's published one. The row-level doc.is_published
+	// cannot answer this: it describes only the latest version, so with an
+	// approved v1 and a pending v2 it is false for both.
+	// The published version can only go when it is the *only* one — then the whole
+	// document goes with it and nothing is left pointing at a missing file. The
+	// backend applies the same rule; this just avoids drawing a button that 400s.
+	const mayDeleteVersion = (version: any, versions: any[]) =>
+		(!version.is_published || versions.length <= 1) &&
+		(canReview || version.author_id === $user?.id);
+
+	const confirmVersionDelete = async () => {
+		const target = confirmVersion;
+		if (!target || deletingVersion) return;
+
+		deletingVersion = true;
+		const res = await deleteKnowledgeVersion(
+			localStorage.token,
+			knowledgeId,
+			target.version.id
+		).catch((e) => {
+			toast.error(`${e}`);
+			return null;
+		});
+		deletingVersion = false;
+		confirmVersion = null;
+
+		if (res) {
+			toast.success($i18n.t('Deleted'));
+			delete expanded[target.documentId];
+			// Removing the last version removes the document, so the row itself is
+			// gone — a plain history reload would render an empty panel under a row
+			// that no longer exists.
+			await load();
+		}
+	};
+
+	// version_id of the version whose review form is open, if any. Only one at a
+	// time — reviewing is a deliberate act, not something to fan out across the
+	// list.
+	//
+	// Keyed on the VERSION, not the document: the registry row only ever shows the
+	// latest revision, so once a v3 is uploaded a v2 still awaiting review becomes
+	// unreachable from it. The same badge in «История» opens this form for any
+	// pending revision, and the backend approves whichever version_id it is given
+	// regardless of newer ones existing.
 	let reviewingId: string | null = null;
 	let reviewNote = '';
 	let submitting = false;
 
-	const openReview = (documentId: string) => {
-		reviewingId = reviewingId === documentId ? null : documentId;
+	const openReview = (versionId: string) => {
+		reviewingId = reviewingId === versionId ? null : versionId;
 		reviewNote = '';
 	};
 
@@ -129,8 +311,15 @@
 			reviewNote = '';
 			// Reload rather than patch in place: approving republishes the document,
 			// which changes is_published on the row and what the model can retrieve.
+			const wasExpanded = expanded[documentId] !== undefined;
 			delete expanded[documentId];
+			expanded = expanded;
 			await load();
+			// Reviewing from «История» should leave «История» open, showing the
+			// verdict that was just recorded — toggleHistory refetches it.
+			if (wasExpanded) {
+				await toggleHistory(documentId);
+			}
 		}
 	};
 
@@ -151,22 +340,57 @@
 	onMount(load);
 </script>
 
+<ConfirmDialog
+	show={confirmDeleteId !== null}
+	message={$i18n.t(
+		'This action cannot be undone. The document and its entire version history will be removed from the knowledge base.'
+	)}
+	confirmLabel={$i18n.t('Delete')}
+	on:confirm={confirmDelete}
+	on:cancel={() => (confirmDeleteId = null)}
+/>
+
+<ConfirmDialog
+	show={confirmVersion !== null}
+	message={(expanded[confirmVersion?.documentId ?? '']?.length ?? 0) <= 1
+		? $i18n.t(
+				'This is the only revision, so the document will be removed from the knowledge base as well. This action cannot be undone.'
+			)
+		: $i18n.t('This action cannot be undone. This revision will be removed from the history.')}
+	confirmLabel={$i18n.t('Delete')}
+	on:confirm={confirmVersionDelete}
+	on:cancel={() => (confirmVersion = null)}
+/>
+
+<input
+	bind:this={versionInput}
+	type="file"
+	class="hidden"
+	on:change={onVersionPicked}
+	aria-label={$i18n.t('Upload new version')}
+/>
+
 <div class="flex flex-col w-full">
-	<div class="flex items-center gap-2 px-1 pb-2">
-		<div class="self-center text-gray-400">
-			<Search className="size-3.5" />
+	<!-- Uploads in flight, above the list and outside the loading branch: a refresh
+	     triggered by the upload itself would otherwise blank them out at exactly the
+	     moment the user needs to see progress. -->
+	{#each uploading as item (item.itemId ?? item.id ?? item.name)}
+		<div class="w-full border-b border-gray-50 dark:border-gray-850 py-2">
+			<div class="flex items-center gap-2.5 w-full">
+				<div class="shrink-0 text-gray-500"><Spinner className="size-4" /></div>
+				<div class="flex-1 min-w-0">
+					<div class="text-sm font-medium truncate text-gray-500">
+						{item.name ?? item.filename ?? ''}
+					</div>
+					<div class="text-xs text-gray-400">{$i18n.t('Uploading...')}</div>
+				</div>
+			</div>
 		</div>
-		<input
-			class="w-full text-sm bg-transparent outline-hidden"
-			bind:value={query}
-			on:input={onSearchInput}
-			placeholder={$i18n.t('Search')}
-		/>
-	</div>
+	{/each}
 
 	{#if loading}
 		<div class="flex justify-center py-6"><Spinner className="size-5" /></div>
-	{:else if documents.length === 0}
+	{:else if documents.length === 0 && uploading.length === 0}
 		<div class="py-6 text-center text-xs text-gray-500">{$i18n.t('No content found')}</div>
 	{:else}
 		<div class="flex flex-col w-full">
@@ -178,7 +402,15 @@
 						</div>
 
 						<div class="flex-1 min-w-0">
-							<div class="text-sm font-medium truncate">{doc.filename}</div>
+							<!-- The filename downloads too — clicking a document's name is what
+							     people try first; the explicit «Скачать» link stays for discoverability. -->
+							<a
+								class="block text-sm font-medium truncate hover:underline"
+								href={`${WEBUI_API_BASE_URL}/files/${doc.file_id}/content`}
+								target="_blank"
+								rel="noopener noreferrer"
+								title={doc.filename}>{doc.filename}</a
+							>
 							<div class="text-xs text-gray-500 truncate">
 								{dayjs(doc.updated_at * 1000).fromNow()}
 								{#if doc.author?.name}· {doc.author.name}{/if}
@@ -196,7 +428,7 @@
 									type="button"
 									class="cursor-pointer"
 									title={$i18n.t('Approve')}
-									on:click={() => openReview(doc.document_id)}
+									on:click={() => openReview(doc.version_id)}
 								>
 									<Badge type={statusType(doc.status)} content={statusLabel(doc.status)} />
 								</button>
@@ -211,42 +443,46 @@
 								rel="noopener noreferrer">{$i18n.t('Download')}</a
 							>
 
+							{#if canUpload}
+								<button
+									type="button"
+									class="text-xs underline disabled:opacity-50"
+									disabled={uploadingId !== null}
+									on:click={() => pickNewVersion(doc.document_id)}
+								>
+									{uploadingId === doc.document_id
+										? $i18n.t('Uploading...')
+										: $i18n.t('Upload new version')}
+								</button>
+							{/if}
+
 							<button
 								type="button"
 								class="text-xs underline"
 								on:click={() => toggleHistory(doc.document_id)}>{$i18n.t('History')}</button
 							>
+
+							{#if mayDelete(doc)}
+								<button
+									type="button"
+									class="text-xs underline text-red-600 dark:text-red-500 disabled:opacity-50"
+									disabled={deleting}
+									on:click={() => (confirmDeleteId = doc.document_id)}
+									>{$i18n.t('Delete entire chain')}</button
+								>
+							{/if}
 						</div>
 					</div>
 
-					{#if reviewingId === doc.document_id}
-						<div class="mt-2 ml-7 flex flex-col gap-2 rounded-lg bg-gray-50 dark:bg-gray-850 p-2.5">
-							<input
-								class="w-full text-xs bg-transparent outline-hidden"
-								bind:value={reviewNote}
-								placeholder={$i18n.t('Reason (optional)')}
+					{#if reviewingId === doc.version_id}
+						<div class="ml-7">
+							<VersionReviewForm
+								bind:note={reviewNote}
+								{submitting}
+								onApprove={() => review(doc.document_id, doc.version_id ?? '', true)}
+								onReject={() => review(doc.document_id, doc.version_id ?? '', false)}
+								onCancel={() => (reviewingId = null)}
 							/>
-							<div class="flex gap-2">
-								<button
-									type="button"
-									class="px-2.5 py-1 rounded-lg text-xs font-medium bg-green-600 hover:bg-green-700 text-white disabled:opacity-50"
-									disabled={submitting}
-									on:click={() => review(doc.document_id, doc.version_id ?? '', true)}
-									>{$i18n.t('Approve')}</button
-								>
-								<button
-									type="button"
-									class="px-2.5 py-1 rounded-lg text-xs font-medium bg-red-600 hover:bg-red-700 text-white disabled:opacity-50"
-									disabled={submitting}
-									on:click={() => review(doc.document_id, doc.version_id ?? '', false)}
-									>{$i18n.t('Reject')}</button
-								>
-								<button
-									type="button"
-									class="px-2.5 py-1 rounded-lg text-xs"
-									on:click={() => (reviewingId = null)}>{$i18n.t('Cancel')}</button
-								>
-							</div>
 						</div>
 					{/if}
 
@@ -256,16 +492,104 @@
 								<Spinner className="size-4" />
 							{:else}
 								{#each expanded[doc.document_id] ?? [] as version (version.id)}
-									<div class="flex gap-2 text-xs text-gray-500 py-0.5">
+									<!-- Each revision carries its own verdict: without it a reader
+									     cannot tell whether the version a pending one supersedes was
+									     approved or rejected. `comment` is the author's changelog,
+									     `review_note` the reviewer's — different people, shown apart. -->
+									<div class="flex gap-2 text-xs text-gray-500 py-1 items-baseline">
 										<span class="w-8 shrink-0">v{version.version_no}</span>
-										<span class="w-24 shrink-0"
-											>{dayjs(version.created_at * 1000).format('DD.MM.YYYY')}</span
+										<span class="w-32 shrink-0"
+											>{dayjs(version.created_at * 1000).format('DD.MM.YYYY HH:mm')}</span
 										>
-										<span class="truncate">
-											{version.comment ?? ''}{#if version.review_note}
-												— {version.review_note}{/if}
+										<span class="shrink-0">
+											{#if canReview && version.status === 'pending' && version.id !== doc.version_id}
+												<!-- The registry row above only ever shows the LATEST
+												     revision, so a v2 still awaiting review becomes
+												     unreachable the moment a v3 is uploaded. This badge is
+												     the way back to it — approving here publishes v2 even
+												     though a newer pending revision exists.
+												
+												     Skipped for the row's own version: reviewingId is a
+												     version id, so that one would match both this form and
+												     the row's, rendering the controls twice. Explicit
+												     inequality, not a truthiness test — doc.version_id is
+												     null for a legacy document with no version row, and
+												     those badges should stay clickable. -->
+												<button
+													type="button"
+													class="cursor-pointer"
+													title={$i18n.t('Approve')}
+													on:click={() => openReview(version.id)}
+												>
+													<Badge
+														type={statusType(version.status)}
+														content={statusLabel(version.status)}
+													/>
+												</button>
+											{:else}
+												<Badge
+													type={statusType(version.status)}
+													content={statusLabel(version.status)}
+												/>
+											{/if}
+										</span>
+
+										<!-- The file as uploaded for THIS revision. Versions of one
+										     document routinely carry different filenames, and the
+										     registry row above can only show the latest. `filename` is
+										     null when the underlying file row is gone; the row still
+										     renders, just without a download. -->
+										{#if version.filename}
+											<a
+												class="w-40 shrink-0 truncate hover:underline"
+												href={`${WEBUI_API_BASE_URL}/knowledge/${knowledgeId}/version/${version.id}/download`}
+												target="_blank"
+												rel="noopener noreferrer"
+												title={version.filename}>{version.filename}</a
+											>
+											<a
+												class="shrink-0 underline"
+												href={`${WEBUI_API_BASE_URL}/knowledge/${knowledgeId}/version/${version.id}/download`}
+												target="_blank"
+												rel="noopener noreferrer">{$i18n.t('Download')}</a
+											>
+										{/if}
+
+										{#if mayDeleteVersion(version, expanded[doc.document_id] ?? [])}
+											<button
+												type="button"
+												class="shrink-0 underline text-red-600 dark:text-red-500 disabled:opacity-50"
+												disabled={deletingVersion}
+												on:click={() => (confirmVersion = { documentId: doc.document_id, version })}
+												>{$i18n.t('Delete')}</button
+											>
+										{/if}
+
+										<span class="min-w-0 truncate">
+											{#if version.author?.name}{version.author.name}{/if}{#if version.comment}
+												— {version.comment}{/if}
+											{#if version.review_note || version.reviewer?.name}
+												<span class="text-gray-400">
+													·
+													{#if version.reviewer?.name}{$i18n.t('Reviewed by')}: {version.reviewer
+															.name}{/if}{#if version.review_note}
+														— {version.review_note}{/if}
+												</span>
+											{/if}
 										</span>
 									</div>
+
+									{#if reviewingId === version.id && version.id !== doc.version_id}
+										<div class="pb-2 pr-2">
+											<VersionReviewForm
+												bind:note={reviewNote}
+												{submitting}
+												onApprove={() => review(doc.document_id, version.id, true)}
+												onReject={() => review(doc.document_id, version.id, false)}
+												onCancel={() => (reviewingId = null)}
+											/>
+										</div>
+									{/if}
 								{/each}
 							{/if}
 						</div>

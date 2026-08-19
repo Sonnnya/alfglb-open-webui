@@ -42,14 +42,13 @@ export const isMenuItemVisible = (id: string, config: any, user: any): boolean =
 			// flattens that into the session payload before it crosses the wire.
 			return user?.role === 'admin' || (user?.permissions?.workspace?.knowledge ?? false);
 		case 'workspace':
-			return (
-				user?.role === 'admin' ||
-				user?.permissions?.workspace?.models ||
-				user?.permissions?.workspace?.knowledge ||
-				user?.permissions?.workspace?.prompts ||
-				user?.permissions?.workspace?.tools ||
-				user?.permissions?.workspace?.skills
-			);
+			// Admin-only in this build. The upstream test was "holds any workspace
+			// permission", which let an Эксперт in on workspace.knowledge alone — and
+			// the only tab they could see there was the collections list, which is
+			// itself hidden now. «База знаний» above is their entry point instead.
+			// src/routes/(app)/workspace/+layout.svelte enforces the same rule; this
+			// only decides whether to draw the menu entry.
+			return user?.role === 'admin';
 		case 'automations':
 			return (
 				config?.features?.enable_automations &&

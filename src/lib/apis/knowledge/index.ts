@@ -675,16 +675,27 @@ export const updateKnowledgeAccessGrants = async (
 	return res;
 };
 
+/**
+ * Attach an already-uploaded file to a knowledge base as a version awaiting review.
+ *
+ * Pass `documentId` to record the file as the next version of an existing document
+ * instead of creating a new one; the backend rejects a document belonging to another
+ * knowledge base. Either way the version is `pending` and reaches neither the vector
+ * store nor the model until a Мастер-эксперт approves it.
+ */
 export const addFileToKnowledgeById = async (
 	token: string,
 	id: string,
 	fileId: string,
-	directoryId?: string | null
+	directoryId?: string | null,
+	opts?: { documentId?: string | null; comment?: string | null }
 ) => {
 	let error = null;
 
 	const body: Record<string, string> = { file_id: fileId };
 	if (directoryId) body.directory_id = directoryId;
+	if (opts?.documentId) body.document_id = opts.documentId;
+	if (opts?.comment) body.comment = opts.comment;
 
 	const res = await fetch(`${WEBUI_API_BASE_URL}/knowledge/${id}/file/add`, {
 		method: 'POST',
@@ -1177,6 +1188,77 @@ export const getKnowledgeDocuments = async (
 		});
 
 	if (error) throw error;
+	return res;
+};
+
+/**
+ * Delete a document and its entire version history.
+ *
+ * Not the same as removing a file: this reaches documents that were never
+ * approved, and it takes every revision with it. The backend allows it for the
+ * document's creator, a Мастер-эксперт, or an admin.
+ */
+export const deleteKnowledgeDocument = async (token: string, id: string, documentId: string) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/knowledge/${id}/document/${documentId}`, {
+		method: 'DELETE',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			authorization: `Bearer ${token}`
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail;
+			console.error(err);
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+/**
+ * Delete a single revision, leaving the rest of the history in place.
+ *
+ * Allowed for the version's own author (an Эксперт withdrawing what they
+ * proposed), a Мастер-эксперт, or an admin. The published version is refused —
+ * use deleteKnowledgeDocument for that. Resolves to `{ deleted_document }`,
+ * true when that was the document's last remaining version.
+ */
+export const deleteKnowledgeVersion = async (token: string, id: string, versionId: string) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/knowledge/${id}/version/${versionId}`, {
+		method: 'DELETE',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			authorization: `Bearer ${token}`
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail;
+			console.error(err);
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
 	return res;
 };
 

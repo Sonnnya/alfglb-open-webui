@@ -69,17 +69,29 @@ MASTER_EXPERT_GROUP_ID = 'master-expert'
 # with no t() wrapper), so they are NOT translatable through i18n — they carry
 # the language they were written in. This deployment is Russian, so they are
 # Russian. Admins can edit both from the group UI at any time.
+# `data.config.share` is «Никто» (False) rather than the global default
+# ('members'): it decides whether a non-admin *member* may pick the group as a
+# share target for their chats and models (routers/groups.py:44 only applies the
+# filter for non-admins). A tier group exists to grant knowledge-base access, not
+# to be a sharing destination.
+#
+# It does NOT govern membership — adding or removing members is admin-only on
+# every route in routers/groups.py, so no tier member can enlist anyone whatever
+# this is set to. Admins can still flip it in the group form; only the keys under
+# `permissions` are re-asserted on boot (see _enforce_seeded_permissions).
 TIER_GROUPS = {
     EXPERT_GROUP_ID: {
         'name': 'Эксперт',
         'description': 'Эксперт. Может предлагать (загружать) файлы, которые будут добавлены в базу знаний только после одобрения Мастером-экспертом. Системная группа - нельзя удалить.',
         'permissions': {'workspace': {'knowledge': True}},
+        'data': {'config': {'share': False}},
         'meta': {'system': True},
     },
     MASTER_EXPERT_GROUP_ID: {
         'name': 'Мастер-эксперт',
         'description': 'Мастер-эксперт. Может одобрять файлы (будут добавлены в базу знаний только после этого). Системная группа - нельзя удалить.',
         'permissions': {'workspace': {'knowledge': True, 'knowledge_review': True}},
+        'data': {'config': {'share': False}},
         'meta': {'system': True},
     },
 }
