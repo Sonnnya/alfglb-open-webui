@@ -79,7 +79,7 @@ TIER_GROUPS = {
     MASTER_EXPERT_GROUP_ID: {
         'name': 'Мастер-эксперт',
         'description': 'Мастер-эксперт. Может одобрять файлы (будут добавлены в базу знаний только после этого). Системная группа - нельзя удалить.',
-        'permissions': {'workspace': {'knowledge': True}},
+        'permissions': {'workspace': {'knowledge': True, 'knowledge_review': True}},
         'meta': {'system': True},
     },
 }
@@ -87,6 +87,52 @@ TIER_GROUPS = {
 
 async def seed_tier_groups():
     await Groups.seed_defaults(TIER_GROUPS)
+
+
+# ── The knowledge base ────────────────────────────────────────────────
+#
+# This deployment has exactly one knowledge base, about welding, and the
+# «База знаний» menu entry links straight to its collection screen rather
+# than to the collections list. The id is literal and stable for the same
+# reason the tier group ids are: seeding is keyed on it, and the frontend
+# builds the link from the same string. Keep in sync with WELDING_KB_ID in
+# src/lib/constants.ts.
+#
+# Both tiers get read + write. Write is what lets an Эксперт upload at all
+# (POST /knowledge/{id}/file/add checks for a write grant). Note this means
+# an expert's upload lands in the base immediately — the approval step the
+# tier description promises is not implemented, so nothing holds a file back
+# pending a Мастер-эксперт. Narrowing expert to 'read' would enforce the
+# promise but leave experts unable to contribute anything at all.
+WELDING_KB_ID = 'welding-kb'
+
+SEED_KNOWLEDGE_BASES = {
+    WELDING_KB_ID: {
+        'name': 'База знаний по сварке',
+        'description': (
+            'База знаний по сварке. Использовать каждый раз, когда нужна точная информация по сварке (т.е. всегда)'
+        ),
+        'meta': {'system': True},
+        'grants': [
+            ('group', EXPERT_GROUP_ID, 'read'),
+            ('group', EXPERT_GROUP_ID, 'write'),  # =proposing file, but file shouldn't go in vector db before approval
+            ('group', MASTER_EXPERT_GROUP_ID, 'read'),
+            (
+                'group',
+                MASTER_EXPERT_GROUP_ID,
+                'write',
+            ),  # =proposing file, but file shouldn't go in vector db before approval
+        ],
+    },
+}
+
+
+async def seed_knowledge_bases():
+    # Imported here, not at module scope: models.knowledge imports this module
+    # for RAG_FILE_CONTENT_SEARCH_MAX_CHARS, so a top-level import would cycle.
+    from open_webui.models.knowledge import Knowledges
+
+    await Knowledges.seed_defaults(SEED_KNOWLEDGE_BASES)
 
 
 async def async_reset_config():
@@ -1749,6 +1795,14 @@ USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ACCESS = (
     os.getenv('USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ACCESS', 'False').lower() == 'true'
 )
 
+# Approving a revision is what publishes it to the vector store, so this is the
+# capability that distinguishes Мастер-эксперт from Эксперт. Expressed as a
+# permission rather than a group-id check so the frontend can read it: group
+# membership never crosses the wire, resolved permissions do.
+USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_REVIEW = (
+    os.getenv('USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_REVIEW', 'False').lower() == 'true'
+)
+
 USER_PERMISSIONS_WORKSPACE_PROMPTS_ACCESS = (
     os.getenv('USER_PERMISSIONS_WORKSPACE_PROMPTS_ACCESS', 'False').lower() == 'true'
 )
@@ -1945,6 +1999,7 @@ DEFAULT_USER_PERMISSIONS = {
     'workspace': {
         'models': USER_PERMISSIONS_WORKSPACE_MODELS_ACCESS,
         'knowledge': USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ACCESS,
+        'knowledge_review': USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_REVIEW,
         'prompts': USER_PERMISSIONS_WORKSPACE_PROMPTS_ACCESS,
         'tools': USER_PERMISSIONS_WORKSPACE_TOOLS_ACCESS,
         'skills': USER_PERMISSIONS_WORKSPACE_SKILLS_ACCESS,

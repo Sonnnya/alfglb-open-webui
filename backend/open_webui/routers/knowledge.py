@@ -28,6 +28,12 @@ from open_webui.models.knowledge import (
     KnowledgeResponse,
     Knowledges,
     KnowledgeUserResponse,
+    KnowledgeDocumentListResponse,
+    KnowledgeFileVersionModel,
+    VERSION_STATUS_APPROVED,
+    VERSION_STATUS_PENDING,
+    VERSION_STATUS_REJECTED,
+    is_system_knowledge,
 )
 from open_webui.models.models import ModelForm, Models
 from open_webui.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
@@ -1358,6 +1364,66 @@ async def get_knowledge_files_by_id(
 class KnowledgeFileIdForm(BaseModel):
     file_id: str
     directory_id: Optional[str] = None
+    # When set, the upload is a new revision of an existing document rather than a
+    # new document.
+    document_id: Optional[str] = None
+    comment: Optional[str] = None  # author's changelog line, shown in «История»
+
+
+class VersionReviewForm(BaseModel):
+    review_note: Optional[str] = None
+
+
+class PublishAsOwner:
+    """Stand-in actor for a publish whose authorisation has *already* been checked.
+
+    ``process_file`` resolves the file by owner unless the actor is an admin
+    (routers/retrieval.py:1822-1826), so a Мастер-эксперт publishing another
+    expert's upload would otherwise get a 404. Every caller below performs the
+    tier check first; this bypasses only the ownership lookup, and collection
+    access is still validated inside ``process_file``.
+    """
+
+    role = 'admin'
+
+    def __init__(self, user):
+        self.id = user.id
+        self.name = getattr(user, 'name', '')
+        self.email = getattr(user, 'email', '')
+
+
+async def _may_review(user, db) -> bool:
+    """Only a Мастер-эксперт or an administrator may approve or reject.
+
+    Checked through the permission rather than group membership so the backend
+    and the UI agree: the seeded Мастер-эксперт group carries this key, and
+    get_permissions() flattens it into the session payload the frontend reads.
+    A group-id test here would leave the UI unable to ask the same question.
+    """
+    return user.role == 'admin' or await has_permission(
+        user.id, 'workspace.knowledge_review', await Config.get('user.permissions'), db=db
+    )
+
+
+async def _publish_version(request, knowledge_id: str, document_id: str, file_id: str, user, db) -> None:
+    """Make a version the published one: swap the vector content, then repoint the
+    document. Mirrors the ordering already used by /{id}/file/update — drop the old
+    chunks first so the duplicate-content guard in save_docs_to_vector_db
+    (routers/retrieval.py:1640) cannot reject a re-upload of near-identical text."""
+    document = await Knowledges.get_document_by_id(document_id, db=db)
+    if document and document.file_id:
+        try:
+            await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=knowledge_id, filter={'file_id': document.file_id})
+        except Exception as e:
+            log.debug(f'No existing chunks to drop for {document.file_id}: {e}')
+
+    await process_file(
+        request,
+        ProcessFileForm(file_id=file_id, collection_name=knowledge_id),
+        user=PublishAsOwner(user),
+        db=db,
+    )
+    await Knowledges.publish_version(document_id, file_id, db=db)
 
 
 @router.post('/{id}/file/add', response_model=KnowledgeFilesResponse | None)
@@ -1413,23 +1479,50 @@ async def add_file_to_knowledge_by_id(
                 detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
             )
 
-    # Add content to the vector database
+    # Uploading records a version; it never publishes. Nothing reaches the vector
+    # store — and therefore the model — until a Мастер-эксперт approves it. This
+    # holds for *every* uploader, including a Мастер-эксперт or an administrator:
+    # every document goes through review so the queue and the history are a
+    # complete record of what entered the knowledge base and who released it.
     try:
-        await process_file(
-            request,
-            ProcessFileForm(file_id=form_data.file_id, collection_name=id),
-            user=user,
-            db=db,
-        )
+        if form_data.document_id:
+            document = await Knowledges.get_document_by_id(form_data.document_id, db=db)
+            if not document or document.knowledge_id != id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=ERROR_MESSAGES.NOT_FOUND,
+                )
+            version = await Knowledges.add_version(
+                knowledge_file_id=document.id,
+                file_id=form_data.file_id,
+                author_id=user.id,
+                comment=form_data.comment,
+                db=db,
+            )
+        else:
+            created = await Knowledges.create_document(
+                knowledge_id=id,
+                file_id=form_data.file_id,
+                author_id=user.id,
+                comment=form_data.comment,
+                directory_id=form_data.directory_id,
+                db=db,
+            )
+            if not created:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=ERROR_MESSAGES.DEFAULT('Error adding document'),
+                )
+            document, version = created
 
-        # Add file to knowledge base
-        await Knowledges.add_file_to_knowledge_by_id(
-            knowledge_id=id,
-            file_id=form_data.file_id,
-            user_id=user.id,
-            directory_id=form_data.directory_id,
-            db=db,
-        )
+        if not version:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=ERROR_MESSAGES.DEFAULT('Error adding version'),
+            )
+
+    except HTTPException:
+        raise
     except Exception as e:
         log.debug(e)
         raise HTTPException(
@@ -1596,15 +1689,16 @@ async def remove_file_from_knowledge_by_id(
 
     await Knowledges.remove_file_from_knowledge_by_id(knowledge_id=id, file_id=form_data.file_id, db=db)
 
-    # Remove content from the vector database
+    # Remove content from the vector database.
+    #
+    # By file_id only. Upstream also swept by {'hash': file.hash}, but that hash is
+    # sha256 of the *extracted text* (routers/retrieval.py:1943), so two versions of
+    # one document that differ only inside an image share it — and the sweep is
+    # collection-wide, so deleting one version silently purged the other's chunks
+    # while the UI still showed it as published. Every chunk carries file_id
+    # (retrieval.py:1981), so the filter below is already complete.
     try:
-        await ASYNC_VECTOR_DB_CLIENT.delete(
-            collection_name=knowledge.id, filter={'file_id': form_data.file_id}
-        )  # Remove by file_id first
-
-        await ASYNC_VECTOR_DB_CLIENT.delete(
-            collection_name=knowledge.id, filter={'hash': file.hash}
-        )  # Remove by hash as well in case of duplicates
+        await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=knowledge.id, filter={'file_id': form_data.file_id})
     except Exception as e:
         log.debug('This was most likely caused by bypassing embedding processing')
         log.debug(e)
@@ -1662,6 +1756,16 @@ async def delete_knowledge_by_id(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    # The seeded base is what the «База знаний» menu entry links to, and deletion
+    # here only needs a *write* grant — which both tiers hold so they can upload.
+    # Without this an Эксперт could delete the whole base and break the link for
+    # everyone until the next restart re-seeds it.
+    if is_system_knowledge(knowledge):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.DEFAULT('System knowledge bases cannot be deleted'),
         )
 
     if (
@@ -1939,8 +2043,10 @@ async def sync_knowledge_cleanup(
         await Knowledges.remove_file_from_knowledge_by_id(id, file_id, db=db)
 
         try:
+            # file_id only — see the note on the other removal paths; the hash is
+            # sha256 of extracted text, so a collection-wide hash sweep can purge a
+            # different version of the same document.
             await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=id, filter={'file_id': file_id})
-            await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=id, filter={'hash': file.hash})
         except Exception:
             pass
 
@@ -2048,9 +2154,13 @@ async def add_files_to_knowledge_batch(
 
     # Process files
     try:
+        # collection_name=None processes each file into its own file-{id}
+        # collection instead of the knowledge base's. Extraction is still validated
+        # — the loop below only adds files that processed cleanly — but nothing
+        # lands in the KB collection, because publishing is approval's job.
         result = await process_files_batch(
             request=request,
-            form_data=BatchProcessFilesForm(files=files, collection_name=id),
+            form_data=BatchProcessFilesForm(files=files, collection_name=None),
             user=user,
             db=db,
         )
@@ -2340,3 +2450,209 @@ async def move_file_in_knowledge(
         data={'knowledge_id': id, 'directory_id': form_data.directory_id},
     )
     return {'status': True}
+
+
+############################
+# Document versions & review
+############################
+
+
+async def _load_kb_for(id: str, user, permission: str, db: AsyncSession):
+    """Fetch a knowledge base and assert the caller's grant on it."""
+    knowledge = await Knowledges.get_knowledge_by_id(id=id, db=db)
+    if not knowledge:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    if (
+        user.role != 'admin'
+        and knowledge.user_id != user.id
+        and not await AccessGrants.has_access(
+            user_id=user.id,
+            resource_type='knowledge',
+            resource_id=knowledge.id,
+            permission=permission,
+            db=db,
+        )
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
+
+    return knowledge
+
+
+async def _load_version_in_kb(id: str, version_id: str, db: AsyncSession):
+    """Fetch a version and the document owning it, asserting both belong to this KB."""
+    version = await Knowledges.get_version_by_id(version_id, db=db)
+    if not version:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    document = await Knowledges.get_document_by_id(version.knowledge_file_id, db=db)
+    if not document or document.knowledge_id != id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    return version, document
+
+
+@router.get('/{id}/document/{document_id}/versions', response_model=list[KnowledgeFileVersionModel])
+async def get_document_versions(
+    id: str,
+    document_id: str,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """«История» for one document — every revision, newest first."""
+    await _load_kb_for(id, user, 'read', db)
+
+    document = await Knowledges.get_document_by_id(document_id, db=db)
+    if not document or document.knowledge_id != id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    return await Knowledges.get_versions(document_id, db=db)
+
+
+@router.get('/{id}/versions/pending', response_model=list[KnowledgeFileVersionModel])
+async def get_pending_versions(
+    id: str,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """The review queue: everything awaiting a Мастер-эксперт."""
+    await _load_kb_for(id, user, 'read', db)
+    return [version for version, _document in await Knowledges.get_pending_versions(id, db=db)]
+
+
+@router.get('/{id}/version/{version_id}/content')
+async def get_version_content(
+    id: str,
+    version_id: str,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Read a version's extracted text, including one that is not published.
+
+    Reviewers must be able to open what they are asked to approve, and an
+    unpublished version deliberately has no ``knowledge_file`` row — so
+    ``has_access_to_file`` cannot resolve it (utils/access_control/files.py:45).
+    Authorising on the *knowledge base* here, rather than widening that helper,
+    keeps the grant scoped to this KB instead of leaking access through any KB
+    relationship the file might have.
+    """
+    await _load_kb_for(id, user, 'read', db)
+    version, _document = await _load_version_in_kb(id, version_id, db)
+
+    file = await Files.get_file_by_id(version.file_id, db=db)
+    if not file:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    return {
+        'id': file.id,
+        'filename': file.filename,
+        'meta': file.meta,
+        'content': (file.data or {}).get('content', ''),
+        'version': version.model_dump(),
+    }
+
+
+@router.post('/{id}/version/{version_id}/approve', response_model=KnowledgeFileVersionModel)
+async def approve_version(
+    request: Request,
+    id: str,
+    version_id: str,
+    form_data: VersionReviewForm,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Publish a version: this is the only path by which content becomes reachable
+    by the model."""
+    knowledge = await _load_kb_for(id, user, 'write', db)
+    if is_external_knowledge(knowledge):
+        external_knowledge_error()
+
+    if not await _may_review(user, db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
+
+    version, document = await _load_version_in_kb(id, version_id, db)
+    if version.status == VERSION_STATUS_APPROVED:
+        return version
+
+    updated = await Knowledges.set_version_status(
+        version_id, VERSION_STATUS_APPROVED, user.id, review_note=form_data.review_note, db=db
+    )
+    try:
+        await _publish_version(request, id, document.id, version.file_id, user, db)
+    except Exception as e:
+        # Roll the status back rather than claim an approval that never published.
+        await Knowledges.set_version_status(
+            version_id, VERSION_STATUS_PENDING, user.id, review_note=f'publish failed: {e}', db=db
+        )
+        log.exception(e)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    await publish_event(
+        request,
+        EVENTS.KNOWLEDGE_FILE_ADDED,
+        actor=user,
+        subject_id=version.file_id,
+        data={'knowledge_id': id, 'document_id': document.id, 'version_no': version.version_no},
+    )
+    return updated
+
+
+@router.post('/{id}/version/{version_id}/reject', response_model=KnowledgeFileVersionModel)
+async def reject_version(
+    id: str,
+    version_id: str,
+    form_data: VersionReviewForm,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Reject a version. The previously published version stays published, so a
+    rejection never reduces what the model already knows."""
+    await _load_kb_for(id, user, 'write', db)
+
+    if not await _may_review(user, db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
+
+    version, _document = await _load_version_in_kb(id, version_id, db)
+    return await Knowledges.set_version_status(
+        version_id, VERSION_STATUS_REJECTED, user.id, review_note=form_data.review_note, db=db
+    )
+
+
+@router.get('/{id}/documents', response_model=KnowledgeDocumentListResponse)
+async def get_knowledge_documents(
+    id: str,
+    query: str | None = None,
+    status_filter: str | None = Query(None, alias='status'),
+    directory_id: str | None = Query(None, description='Omit for a flat list across all folders.'),
+    page: int | None = 1,
+    limit: int | None = Query(None, description='Page size (admin only). Defaults to 30.'),
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """The document registry the knowledge-base screen renders.
+
+    Unlike GET /{id}/files this includes revisions still awaiting review, so an
+    Эксперт can see what they uploaded. It is never called by the model — the
+    model's search_knowledge tool goes through search_files_by_id, which stays
+    published-only.
+
+    Omitting directory_id gives a flat list spanning every folder; passing one
+    scopes to that folder, so the existing folder layout is still reachable.
+    """
+    await _load_kb_for(id, user, 'read', db)
+
+    page = max(page or 1, 1)
+    if user.role == 'admin' and limit is not None:
+        limit = max(1, limit)
+    else:
+        limit = PAGE_ITEM_COUNT
+
+    filter: dict = {}
+    if query:
+        filter['query'] = query
+    if status_filter:
+        filter['status'] = status_filter
+    if directory_id is not None:
+        filter['directory_id'] = directory_id or None
+
+    return await Knowledges.search_documents_by_id(id, filter=filter, skip=(page - 1) * limit, limit=limit, db=db)

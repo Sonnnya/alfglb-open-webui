@@ -36,6 +36,7 @@
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import BookOpen from '$lib/components/icons/BookOpen.svelte';
 	import { DEFAULT_PINNED_ITEMS, migratePinnedItems } from '$lib/utils/menu-items';
+	import { WELDING_KB_HREF } from '$lib/constants';
 	import Pin from '$lib/components/icons/Pin.svelte';
 	import PinSlash from '$lib/components/icons/PinSlash.svelte';
 	import { updateUserStatus, updateUserSettings } from '$lib/apis/users';
@@ -362,14 +363,14 @@
 			{#if $user?.role === 'admin' || ($user?.permissions?.workspace?.knowledge ?? false)}
 				<div class="flex items-center w-full">
 					<a
-						href="/workspace/knowledge"
+						href={WELDING_KB_HREF}
 						draggable="false"
 						class="flex flex-1 rounded-xl py-1.5 px-3 hover:bg-gray-50 dark:hover:bg-gray-800 transition cursor-pointer select-none"
 						on:click={async (e) => {
 							if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
 							e.preventDefault();
 							show = false;
-							goto('/workspace/knowledge');
+							goto(WELDING_KB_HREF);
 							if ($mobile) {
 								await tick();
 								showSidebar.set(false);

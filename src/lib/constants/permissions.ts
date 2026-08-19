@@ -2,6 +2,7 @@ export const DEFAULT_PERMISSIONS = {
 	workspace: {
 		models: false,
 		knowledge: false,
+		knowledge_review: false,
 		prompts: false,
 		tools: false,
 		skills: false,

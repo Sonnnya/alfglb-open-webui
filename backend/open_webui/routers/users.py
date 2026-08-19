@@ -170,6 +170,7 @@ async def get_user_permissisions(
 class WorkspacePermissions(BaseModel):
     models: bool = False
     knowledge: bool = False
+    knowledge_review: bool = False
     prompts: bool = False
     tools: bool = False
     skills: bool = False

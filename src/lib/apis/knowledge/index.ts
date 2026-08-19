@@ -1124,3 +1124,125 @@ export const moveFileInKnowledge = async (
 
 	return res;
 };
+
+// ── Document registry & review ────────────────────────────────────────
+//
+// These target /knowledge/{id}/documents rather than /files. The two differ on
+// purpose: /files answers "what is published" (and is what the model's
+// search_knowledge tool uses), while /documents is the human-facing registry and
+// includes revisions still awaiting review.
+
+type KnowledgeDocumentQuery = {
+	query?: string;
+	status?: string;
+	directoryId?: string | null;
+	page?: number;
+};
+
+export const getKnowledgeDocuments = async (
+	token: string,
+	id: string,
+	{ query, status, directoryId, page }: KnowledgeDocumentQuery = {}
+) => {
+	let error = null;
+
+	const searchParams = new URLSearchParams();
+	if (query) searchParams.append('query', query);
+	if (status) searchParams.append('status', status);
+	// Only sent when scoping to a folder — omitted gives the flat list.
+	if (directoryId !== undefined && directoryId !== null) {
+		searchParams.append('directory_id', directoryId);
+	}
+	if (page !== undefined) searchParams.append('page', `${page}`);
+
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/knowledge/${id}/documents?${searchParams.toString()}`,
+		{
+			method: 'GET',
+			headers: {
+				Accept: 'application/json',
+				'Content-Type': 'application/json',
+				authorization: `Bearer ${token}`
+			}
+		}
+	)
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail;
+			console.error(err);
+			return null;
+		});
+
+	if (error) throw error;
+	return res;
+};
+
+export const getDocumentVersions = async (token: string, id: string, documentId: string) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/knowledge/${id}/document/${documentId}/versions`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			authorization: `Bearer ${token}`
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail;
+			console.error(err);
+			return null;
+		});
+
+	if (error) throw error;
+	return res;
+};
+
+const reviewVersion = async (
+	token: string,
+	id: string,
+	versionId: string,
+	action: 'approve' | 'reject',
+	reviewNote?: string | null
+) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/knowledge/${id}/version/${versionId}/${action}`, {
+		method: 'POST',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			authorization: `Bearer ${token}`
+		},
+		body: JSON.stringify({ review_note: reviewNote ?? null })
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail;
+			console.error(err);
+			return null;
+		});
+
+	if (error) throw error;
+	return res;
+};
+
+export const approveVersion = (
+	token: string,
+	id: string,
+	versionId: string,
+	note?: string | null
+) => reviewVersion(token, id, versionId, 'approve', note);
+
+export const rejectVersion = (token: string, id: string, versionId: string, note?: string | null) =>
+	reviewVersion(token, id, versionId, 'reject', note);

@@ -19,6 +19,12 @@ export const RETRIEVAL_API_BASE_URL = `${WEBUI_BASE_URL}/api/v1/retrieval`;
 export const EXPERT_GROUP_ID = 'expert';
 export const MASTER_EXPERT_GROUP_ID = 'master-expert';
 
+// The single seeded knowledge base. This deployment has exactly one collection,
+// so «База знаний» links straight to its collection screen instead of the
+// collections list. Keep in sync with WELDING_KB_ID in backend/open_webui/config.py.
+export const WELDING_KB_ID = 'welding-kb';
+export const WELDING_KB_HREF = `/workspace/knowledge/${WELDING_KB_ID}`;
+
 // `label` is only a pre-fetch fallback. The displayed name is the seeded group's
 // own `name` from the API — database content, so it is already localised and no
 // i18n key exists for it. See the tier badge in admin/Users/UserList.svelte.

@@ -424,8 +424,16 @@ class FilesTable:
                 from open_webui.models.knowledge import KnowledgeFile
 
                 # Subquery: file IDs already linked to this knowledge base
+                # isnot(None) is load-bearing: knowledge_file.file_id is NULL for a
+                # document with no approved version yet, and a single NULL inside a
+                # NOT IN subquery makes the whole outer filter return no rows at all.
                 linked_ids = (
-                    select(KnowledgeFile.file_id).filter(KnowledgeFile.knowledge_id == knowledge_id).correlate(None)
+                    select(KnowledgeFile.file_id)
+                    .filter(
+                        KnowledgeFile.knowledge_id == knowledge_id,
+                        KnowledgeFile.file_id.isnot(None),
+                    )
+                    .correlate(None)
                 )
 
                 stmt = (

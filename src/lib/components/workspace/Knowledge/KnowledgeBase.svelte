@@ -54,6 +54,14 @@
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Files from './KnowledgeBase/Files.svelte';
+	import DocumentRegistry from './KnowledgeBase/DocumentRegistry.svelte';
+
+	// Tier membership never reaches the client, so "may review" is asked as a
+	// permission — the seeded Мастер-эксперт group carries workspace.knowledge_review
+	// and get_permissions() flattens it into the session payload. The backend
+	// re-checks the same key, so this only hides buttons.
+	$: canReviewVersions =
+		$user?.role === 'admin' || ($user?.permissions?.workspace?.knowledge_review ?? false);
 	import AddFilesPlaceholder from '$lib/components/AddFilesPlaceholder.svelte';
 
 	import AddContentMenu from './KnowledgeBase/AddContentMenu.svelte';
@@ -129,6 +137,7 @@
 	let direction = null;
 
 	let currentPage = 1;
+	let documentRegistry: { refresh: () => void } | null = null;
 	let fileItems = null;
 	let fileItemsTotal = null;
 
@@ -158,6 +167,10 @@
 	const init = async () => {
 		reset();
 		await getItemsPage();
+		// getItemsPage() only refreshes the legacy /files list. The registry reads
+		// /documents, which is the only source that includes revisions awaiting
+		// review, so it has to be refreshed explicitly after every mutation.
+		documentRegistry?.refresh();
 	};
 
 	const handleSearchInput = () => {
@@ -1553,50 +1566,17 @@
 						<div class="flex-1 flex">
 							<div class=" flex flex-col w-full space-x-2 rounded-lg h-full">
 								<div class="w-full h-full flex flex-col min-h-full">
-									{#if fileItems.length > 0 || directoryItems.length > 0}
+									{#if true}
+										<!-- Flat document registry. Files.svelte (the folder view) is
+										     left in place and can be swapped back in — nothing about the
+										     knowledge_directory schema was removed. -->
 										<div class=" flex overflow-y-auto h-full w-full scrollbar-hidden text-xs">
-											<Files
-												files={fileItems}
-												directories={directoryItems}
-												{knowledge}
-												{selectedFileId}
-												onClick={(fileId) => {
-													selectedFileId = fileId;
-
-													if (fileItems) {
-														const file = fileItems.find((file) => file.id === selectedFileId);
-														if (file) {
-															fileSelectHandler(file);
-														} else {
-															selectedFileId = null;
-															selectedFile = null;
-															selectedFileContent = '';
-															loadingFileContent = false;
-														}
-													}
-												}}
-												onDelete={(fileId) => {
-													selectedFileId = null;
-													selectedFile = null;
-													selectedFileContent = '';
-													loadingFileContent = false;
-
-													deleteFileHandler(fileId);
-												}}
-												onRename={(fileId, name) => renameFileHandler(fileId, name)}
-												onNavigateDirectory={(dirId) => navigateToDirectory(dirId)}
-												onRenameDirectory={(id, name) => renameDirectoryHandler(id, name)}
-												onDeleteDirectory={(id) => confirmDeleteDirectory(id)}
-												onMoveFileToDirectory={(fileId, dirId) =>
-													moveFileToDirectoryHandler(fileId, dirId)}
-												onMoveDirectoryToDirectory={(dirId, targetId) =>
-													moveDirectoryHandler(dirId, targetId)}
+											<DocumentRegistry
+												bind:this={documentRegistry}
+												knowledgeId={knowledge.id}
+												canReview={canReviewVersions}
 											/>
 										</div>
-
-										{#if fileItemsTotal > 30}
-											<Pagination bind:page={currentPage} count={fileItemsTotal} perPage={30} />
-										{/if}
 									{:else}
 										<div
 											class="my-3 flex flex-col justify-center text-center text-gray-500 text-xs"

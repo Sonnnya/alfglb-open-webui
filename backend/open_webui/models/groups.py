@@ -192,13 +192,67 @@ class GroupTable:
                     )
                 )
 
-            if not new_groups:
-                return
+            if new_groups:
+                try:
+                    db.add_all(new_groups)
+                    await db.commit()
+                    log.info('Seeded %d new default group(s): %s', len(new_groups), ', '.join(g.id for g in new_groups))
+                except Exception as e:
+                    log.exception(e)
+                    await db.rollback()
+
+            await self._enforce_seeded_permissions(defaults, existing_ids, db=db)
+
+    async def _enforce_seeded_permissions(
+        self, defaults: dict[str, dict], existing_ids: set[str], db: AsyncSession
+    ) -> None:
+        """Re-assert the keys that *define* a seeded group, on every boot.
+
+        Rows are otherwise left alone — but the keys in the default bundle are what
+        make a tier a tier, and two things quietly erase them: a row seeded before
+        the bundle gained a key never receives it (existing rows win), and saving a
+        group in the admin Permissions form writes the whole resolved tree back,
+        overwriting these keys with the global defaults.
+
+        Only keys named in the bundle are touched; every other permission an admin
+        has set is preserved. To revoke a tier's capability, change TIER_GROUPS or
+        remove members — turning it off in the group form will not stick.
+        """
+
+        def merge(target: dict, enforced: dict) -> bool:
+            changed = False
+            for key, value in enforced.items():
+                if isinstance(value, dict):
+                    branch = target.get(key)
+                    if not isinstance(branch, dict):
+                        branch = {}
+                        target[key] = branch
+                    changed |= merge(branch, value)
+                elif target.get(key) != value:
+                    target[key] = value
+                    changed = True
+            return changed
+
+        for group_id in existing_ids:
+            enforced = (defaults.get(group_id) or {}).get('permissions') or {}
+            if not enforced:
+                continue
+
+            result = await db.execute(select(Group).filter_by(id=group_id))
+            group = result.scalars().first()
+            if not group:
+                continue
+
+            permissions = json.loads(json.dumps(group.permissions or {}))
+            if not merge(permissions, enforced):
+                continue
 
             try:
-                db.add_all(new_groups)
+                await db.execute(
+                    update(Group).filter_by(id=group_id).values(permissions=permissions, updated_at=int(time.time()))
+                )
                 await db.commit()
-                log.info('Seeded %d new default group(s): %s', len(new_groups), ', '.join(g.id for g in new_groups))
+                log.info('Restored defining permissions on seeded group %s', group_id)
             except Exception as e:
                 log.exception(e)
                 await db.rollback()

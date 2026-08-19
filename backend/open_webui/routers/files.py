@@ -201,19 +201,19 @@ async def process_uploaded_file(
                             f'{knowledge_id}: user {user.id} lacks write access'
                         )
                     else:
+                        # Creates the document as pending. Deliberately no
+                        # process_file(collection_name=knowledge_id) here: embedding
+                        # into the knowledge base is what makes content reachable by
+                        # the model, and that must wait for approval. The file has
+                        # already been processed into its own file-{id} collection
+                        # above, so a reviewer can still read it.
                         await Knowledges.add_file_to_knowledge_by_id(
                             knowledge_id=knowledge_id,
                             file_id=file_item.id,
                             user_id=user.id,
                             directory_id=file_metadata.get('directory_id'),
                         )
-                        await process_file(
-                            request,
-                            ProcessFileForm(file_id=file_item.id, collection_name=knowledge_id),
-                            user=user,
-                            db=db_session,
-                        )
-                        log.info(f'Linked file {file_item.id} to knowledge {knowledge_id}')
+                        log.info(f'Linked file {file_item.id} to knowledge {knowledge_id} (pending review)')
                 except Exception as e:
                     log.warning(f'Failed to link file {file_item.id} to knowledge {knowledge_id}: {e}')
 
@@ -987,9 +987,9 @@ async def delete_file_by_id(
             await Knowledges.remove_file_from_knowledge_by_id(knowledge.id, id, db=db)
             # Clean KB embeddings (same logic as /knowledge/{id}/file/remove)
             try:
+                # file_id only — the hash sweep this used to do was collection-wide and
+                # could purge a different version's chunks. See routers/knowledge.py.
                 await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=knowledge.id, filter={'file_id': id})
-                if file.hash:
-                    await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=knowledge.id, filter={'hash': file.hash})
             except Exception as e:
                 log.debug(f'KB embedding cleanup for {knowledge.id}: {e}')
 

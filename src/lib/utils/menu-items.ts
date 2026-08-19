@@ -3,6 +3,8 @@
 // (src/lib/components/layout/Sidebar/UserMenu.svelte). Only the visibility
 // predicate and the metadata are shared — each menu keeps its own rendering.
 
+import { WELDING_KB_HREF } from '$lib/constants';
+
 export const DEFAULT_PINNED_ITEMS = ['knowledge', 'workspace'];
 
 export type MenuItemMeta = { label: string; href: string; iconType: string };
@@ -11,7 +13,8 @@ const MENU_ITEMS: Record<string, MenuItemMeta> = {
 	// 'Knowledge Base' already exists as an i18n key ("База знаний" in ru-RU) and
 	// survives i18n:parse via literals in other components — see the i18n section
 	// of CLAUDE.md before changing this string.
-	knowledge: { label: 'Knowledge Base', href: '/workspace/knowledge', iconType: 'knowledge' },
+	// Links to the one seeded collection, not the collections list.
+	knowledge: { label: 'Knowledge Base', href: WELDING_KB_HREF, iconType: 'knowledge' },
 	workspace: { label: 'Workspace', href: '/workspace', iconType: 'workspace' },
 	automations: { label: 'Automations', href: '/automations', iconType: 'automations' },
 	calendar: { label: 'Calendar', href: '/calendar', iconType: 'calendar' },

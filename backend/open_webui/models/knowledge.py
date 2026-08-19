@@ -2,7 +2,7 @@ import json
 import logging
 import time
 import uuid
-from typing import Optional
+from typing import Literal, Optional
 
 from open_webui.config import RAG_FILE_CONTENT_SEARCH_MAX_CHARS
 from open_webui.internal.db import Base, JSONField, get_async_db_context
@@ -22,9 +22,12 @@ from sqlalchemy import (
     Column,
     ForeignKey,
     Index,
+    Integer,
     String,
     Text,
     UniqueConstraint,
+    and_,
+    case,
     delete,
     func,
     or_,
@@ -32,7 +35,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import defer
+from sqlalchemy.orm import aliased, defer
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +59,16 @@ class Knowledge(Base):
 
     created_at = Column(BigInteger)
     updated_at = Column(BigInteger)
+
+
+def is_system_knowledge(knowledge) -> bool:
+    """True for knowledge bases seeded at startup, which must not be deleted.
+
+    Knowledge has no is_system column, so the marker lives in the meta JSON.
+    KnowledgeForm carries only name / description / access_grants, so the update
+    path can never set or clear it — only the startup seeder writes it.
+    """
+    return bool(knowledge and (getattr(knowledge, 'meta', None) or {}).get('system'))
 
 
 class KnowledgeDirectory(Base):
@@ -100,7 +113,10 @@ class KnowledgeFile(Base):
     id = Column(Text, unique=True, primary_key=True)
 
     knowledge_id = Column(Text, ForeignKey('knowledge.id', ondelete='CASCADE'), nullable=False)
-    file_id = Column(Text, ForeignKey('file.id', ondelete='CASCADE'), nullable=False)
+    # The *published* version's file. NULL while a document's only version is still
+    # awaiting approval — every consumer joins or filters on this column, and both
+    # drop NULL rows, which is what keeps unapproved content away from the model.
+    file_id = Column(Text, ForeignKey('file.id', ondelete='CASCADE'), nullable=True)
     directory_id = Column(Text, ForeignKey('knowledge_directory.id', ondelete='SET NULL'), nullable=True)
     user_id = Column(Text, nullable=False)
 
@@ -116,7 +132,7 @@ class KnowledgeFile(Base):
 class KnowledgeFileModel(BaseModel):
     id: str
     knowledge_id: str
-    file_id: str
+    file_id: Optional[str] = None  # None until a version is approved
     directory_id: Optional[str] = None
     user_id: str
 
@@ -124,6 +140,71 @@ class KnowledgeFileModel(BaseModel):
     updated_at: int  # timestamp in epoch
 
     model_config = ConfigDict(from_attributes=True)
+
+
+VERSION_STATUS_PENDING = 'pending'
+VERSION_STATUS_APPROVED = 'approved'
+VERSION_STATUS_REJECTED = 'rejected'
+
+VersionStatus = Literal['pending', 'approved', 'rejected']
+
+
+class KnowledgeFileVersion(Base):
+    """One uploaded revision of a document.
+
+    ``knowledge_file`` is the *document*: exactly one row per document, whose
+    ``file_id`` always points at the currently published version. Versions that
+    are pending or superseded have a ``file`` row and a row here, but **no**
+    ``knowledge_file`` row — which is what keeps them out of the vector store and
+    out of the seven model-facing consumers of ``Knowledges.get_files_by_id``.
+    Approval is therefore a property of the data's shape, not a filter that seven
+    call sites have to remember.
+    """
+
+    __tablename__ = 'knowledge_file_version'
+
+    id = Column(Text, unique=True, primary_key=True)
+
+    knowledge_file_id = Column(Text, ForeignKey('knowledge_file.id', ondelete='CASCADE'), nullable=False)
+    version_no = Column(Integer, nullable=False)
+    # UNIQUE: a file belongs to exactly one version, which keeps the join back to
+    # the published version 1:1 and stops the listing query fanning out.
+    file_id = Column(Text, ForeignKey('file.id', ondelete='CASCADE'), nullable=False, unique=True)
+    author_id = Column(Text, nullable=False)
+
+    # Plain text rather than a DB enum, matching how user.role is stored — avoids
+    # an enum migration on Postgres when the set of statuses changes.
+    status = Column(Text, nullable=False, default=VERSION_STATUS_PENDING)
+    comment = Column(Text, nullable=True)  # author's changelog for this revision
+    review_note = Column(Text, nullable=True)  # reviewer's reason, e.g. why rejected
+    reviewed_by = Column(Text, nullable=True)
+    reviewed_at = Column(BigInteger, nullable=True)
+
+    created_at = Column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('knowledge_file_id', 'version_no', name='uq_knowledge_file_version_no'),
+        Index('ix_knowledge_file_version_knowledge_file_id', 'knowledge_file_id'),
+        Index('ix_knowledge_file_version_file_id', 'file_id'),
+    )
+
+
+class KnowledgeFileVersionModel(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    knowledge_file_id: str
+    version_no: int
+    file_id: str
+    author_id: str
+
+    status: VersionStatus = VERSION_STATUS_PENDING
+    comment: Optional[str] = None
+    review_note: Optional[str] = None
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[int] = None
+
+    created_at: int
 
 
 class KnowledgeDirectoryModel(BaseModel):
@@ -174,6 +255,42 @@ class KnowledgeListResponse(BaseModel):
     total: int
 
 
+class KnowledgeDocumentResponse(BaseModel):
+    """One row of the document registry: the document plus its *latest* version.
+
+    Deliberately not the same shape as FileUserResponse. That one answers "which
+    files are published", which is the model's question; this one answers "what
+    does a human see in the list", which includes revisions still awaiting review.
+    """
+
+    document_id: str
+    knowledge_id: str
+    directory_id: Optional[str] = None
+
+    file_id: str
+    filename: str
+    meta: Optional[dict] = None
+
+    # The latest version's row id — what approve/reject endpoints take. None for a
+    # legacy document that predates versioning and has no version row.
+    version_id: Optional[str] = None
+    version_no: int
+    status: VersionStatus
+    comment: Optional[str] = None
+    review_note: Optional[str] = None
+
+    author: Optional[UserResponse] = None
+    # True when this exact version is the one the model can retrieve.
+    is_published: bool = False
+    created_at: int
+    updated_at: int
+
+
+class KnowledgeDocumentListResponse(BaseModel):
+    items: list[KnowledgeDocumentResponse]
+    total: int
+
+
 class KnowledgeFileListResponse(BaseModel):
     items: list[FileUserResponse]
     directories: list[KnowledgeDirectoryModel] = Field(default_factory=list)
@@ -196,6 +313,69 @@ class KnowledgeTable:
             access_grants if access_grants is not None else await self._get_access_grants(knowledge_data['id'], db=db)
         )
         return KnowledgeModel.model_validate(knowledge_data)
+
+    async def seed_defaults(self, defaults: dict[str, dict], db: Optional[AsyncSession] = None) -> None:
+        """Insert knowledge bases whose id doesn't yet exist, with their access grants.
+
+        Mirrors Groups.seed_defaults: keyed on the id so a rename cannot produce a
+        duplicate, existing rows win so admin edits survive a restart, and rows are
+        built directly rather than through insert_new_knowledge (which mints its own
+        uuid and drops meta). Self-healing — a base deleted by mistake returns on the
+        next boot, though the menu link is broken until then.
+
+        Each default may carry a 'grants' list of (principal_type, principal_id,
+        permission); grant_access is itself idempotent, so grants are reapplied on
+        every boot and a revoked one comes back. Group principals must already be
+        seeded, so this runs after the tier groups.
+
+        NOTE: unlike the /create route this does not call embed_knowledge_base_metadata(),
+        so a seeded base has no metadata embedding until POST /knowledge/metadata/reindex.
+        That only affects semantic search *across* knowledge bases.
+        """
+        async with get_async_db_context(db) as db:
+            result = await db.execute(select(Knowledge.id).filter(Knowledge.id.in_(defaults.keys())))
+            existing_ids = {row[0] for row in result.all()}
+
+            now = int(time.time())
+            created = []
+            for kb_id, kb in defaults.items():
+                if kb_id in existing_ids:
+                    continue
+                db.add(
+                    Knowledge(
+                        id=kb_id,
+                        # Seeded at startup, so there is no owner. KnowledgeUserModel.user
+                        # is Optional and the list view resolves it with .get(), so an
+                        # unmatched user_id renders as no owner rather than failing.
+                        user_id='',
+                        name=kb['name'],
+                        description=kb.get('description', ''),
+                        meta=kb.get('meta'),
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                created.append(kb_id)
+
+            if created:
+                try:
+                    await db.commit()
+                    log.info('Seeded %d new knowledge base(s): %s', len(created), ', '.join(created))
+                except Exception as e:
+                    log.exception(e)
+                    await db.rollback()
+                    return
+
+            for kb_id, kb in defaults.items():
+                for principal_type, principal_id, permission in kb.get('grants', []):
+                    await AccessGrants.grant_access(
+                        resource_type='knowledge',
+                        resource_id=kb_id,
+                        principal_type=principal_type,
+                        principal_id=principal_id,
+                        permission=permission,
+                        db=db,
+                    )
 
     async def insert_new_knowledge(
         self, user_id: str, form_data: KnowledgeForm, db: Optional[AsyncSession] = None
@@ -679,30 +859,373 @@ class KnowledgeTable:
         directory_id: Optional[str] = None,
         db: Optional[AsyncSession] = None,
     ) -> Optional[KnowledgeFileModel]:
+        """Attach a file to a knowledge base as a document awaiting review.
+
+        This is the **single chokepoint** for putting a file into a knowledge base
+        and it deliberately does NOT publish: the document is created with a NULL
+        file_id and a pending v1, so the content stays out of the vector store
+        until a Мастер-эксперт approves it.
+
+        It used to create a published row directly, and three separate routes call
+        it — POST /knowledge/{id}/file/add, the auto-link inside POST /files/ when
+        the upload carries metadata.knowledge_id, and the batch add. Gating only
+        one of them left the other two publishing on upload. Enforcing the rule
+        here means every caller, including any added later, is correct by default.
+        """
+        created = await self.create_document(
+            knowledge_id=knowledge_id,
+            file_id=file_id,
+            author_id=user_id,
+            directory_id=directory_id,
+            db=db,
+        )
+        return created[0] if created else None
+
+    # ── Document versions ────────────────────────────────────────────
+    #
+    # A "document" is a knowledge_file row. Its versions live in
+    # knowledge_file_version; knowledge_file.file_id is whichever version is
+    # currently published (NULL if none is). Publishing is the only thing that
+    # makes content reachable by the model, so it is deliberately a single
+    # assignment in publish_version() rather than something spread around.
+
+    async def search_documents_by_id(
+        self,
+        knowledge_id: str,
+        filter: Optional[dict] = None,
+        skip: int = 0,
+        limit: int = 30,
+        db: Optional[AsyncSession] = None,
+    ) -> KnowledgeDocumentListResponse:
+        """The human-facing document registry: one row per document, latest version.
+
+        Separate from ``search_files_by_id`` on purpose. That function is what the
+        model's search_knowledge tool calls (tools/builtin.py), so it must keep
+        returning published files only; this one deliberately includes revisions
+        awaiting review, which must never reach the model. Keeping them as two
+        functions means the model path cannot accidentally inherit a change made
+        for the UI.
+
+        Cardinality stays one row per document — the max(version_no) subquery is
+        grouped by document and joined back on equality — so LIMIT/OFFSET and the
+        total count remain correct.
+        """
+        filter = filter or {}
         async with get_async_db_context(db) as db:
-            knowledge_file = KnowledgeFileModel(
-                **{
-                    'id': str(uuid.uuid4()),
-                    'knowledge_id': knowledge_id,
-                    'file_id': file_id,
-                    'directory_id': directory_id,
-                    'user_id': user_id,
-                    'created_at': int(time.time()),
-                    'updated_at': int(time.time()),
-                }
+            latest = (
+                select(
+                    KnowledgeFileVersion.knowledge_file_id.label('kf_id'),
+                    func.max(KnowledgeFileVersion.version_no).label('max_no'),
+                )
+                .group_by(KnowledgeFileVersion.knowledge_file_id)
+                .subquery()
             )
 
-            try:
-                result = KnowledgeFile(**knowledge_file.model_dump())
-                db.add(result)
-                await db.commit()
-                await db.refresh(result)
-                if result:
-                    return KnowledgeFileModel.model_validate(result)
+            version = aliased(KnowledgeFileVersion)
+            # OUTER joins throughout, deliberately. An inner join here silently hides
+            # any document whose version rows are missing — which is exactly what
+            # happened to documents added between the version migration and the
+            # versioned upload path going live. A document must never disappear from
+            # the registry because of a gap in its history.
+            stmt = (
+                select(KnowledgeFile, version, File, User)
+                .outerjoin(latest, latest.c.kf_id == KnowledgeFile.id)
+                .outerjoin(
+                    version,
+                    and_(
+                        version.knowledge_file_id == KnowledgeFile.id,
+                        version.version_no == latest.c.max_no,
+                    ),
+                )
+                # Fall back to the document's published file when no version row exists.
+                .outerjoin(File, File.id == func.coalesce(version.file_id, KnowledgeFile.file_id))
+                .outerjoin(User, User.id == func.coalesce(version.author_id, KnowledgeFile.user_id))
+                .filter(KnowledgeFile.knowledge_id == knowledge_id)
+            )
+
+            query = filter.get('query')
+            if query:
+                stmt = stmt.filter(File.filename.ilike(f'%{query}%'))
+
+            status_filter = filter.get('status')
+            if status_filter:
+                # A versionless document reads as approved when it has a published file.
+                effective_status = func.coalesce(
+                    version.status,
+                    case((KnowledgeFile.file_id.isnot(None), VERSION_STATUS_APPROVED), else_=VERSION_STATUS_PENDING),
+                )
+                stmt = stmt.filter(effective_status == status_filter)
+
+            directory_id = filter.get('directory_id') if 'directory_id' in filter else None
+            if 'directory_id' in filter:
+                if directory_id:
+                    stmt = stmt.filter(KnowledgeFile.directory_id == directory_id)
                 else:
-                    return None
-            except Exception:
+                    stmt = stmt.filter(KnowledgeFile.directory_id.is_(None))
+
+            count_result = await db.execute(select(func.count()).select_from(stmt.subquery()))
+            total = count_result.scalar() or 0
+
+            # File.id as a tiebreaker keeps paging deterministic when timestamps collide.
+            stmt = stmt.order_by(KnowledgeFile.updated_at.desc(), File.id.asc()).offset(skip).limit(limit)
+            stmt = stmt.options(defer(File.data))
+
+            rows = (await db.execute(stmt)).all()
+
+            return KnowledgeDocumentListResponse(
+                items=[
+                    KnowledgeDocumentResponse(
+                        document_id=document.id,
+                        knowledge_id=document.knowledge_id,
+                        directory_id=document.directory_id,
+                        file_id=file.id,
+                        filename=file.filename,
+                        meta=file.meta,
+                        version_id=ver.id if ver else None,
+                        version_no=ver.version_no if ver else 1,
+                        status=(
+                            ver.status
+                            if ver
+                            else (VERSION_STATUS_APPROVED if document.file_id else VERSION_STATUS_PENDING)
+                        ),
+                        comment=ver.comment if ver else None,
+                        review_note=ver.review_note if ver else None,
+                        author=(UserResponse(**UserModel.model_validate(author).model_dump()) if author else None),
+                        is_published=bool(document.file_id) and document.file_id == (ver.file_id if ver else file.id),
+                        created_at=ver.created_at if ver else document.created_at,
+                        updated_at=document.updated_at,
+                    )
+                    for document, ver, file, author in rows
+                    # A row with neither a version nor a published file has no file to
+                    # show at all; skip rather than emit a half-empty entry.
+                    if file is not None
+                ],
+                total=total,
+            )
+
+    async def create_document(
+        self,
+        knowledge_id: str,
+        file_id: str,
+        author_id: str,
+        comment: Optional[str] = None,
+        directory_id: Optional[str] = None,
+        approved: bool = False,
+        db: Optional[AsyncSession] = None,
+    ) -> Optional[tuple[KnowledgeFileModel, KnowledgeFileVersionModel]]:
+        """Create a document with its first version.
+
+        ``approved=False`` leaves ``knowledge_file.file_id`` NULL, so the document
+        exists and is listable but nothing about it reaches the model.
+        """
+        now = int(time.time())
+        async with get_async_db_context(db) as db:
+            try:
+                document = KnowledgeFile(
+                    id=str(uuid.uuid4()),
+                    knowledge_id=knowledge_id,
+                    file_id=file_id if approved else None,
+                    directory_id=directory_id,
+                    user_id=author_id,
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(document)
+                await db.flush()
+
+                version = KnowledgeFileVersion(
+                    id=str(uuid.uuid4()),
+                    knowledge_file_id=document.id,
+                    version_no=1,
+                    file_id=file_id,
+                    author_id=author_id,
+                    status=VERSION_STATUS_APPROVED if approved else VERSION_STATUS_PENDING,
+                    comment=comment,
+                    reviewed_by=author_id if approved else None,
+                    reviewed_at=now if approved else None,
+                    created_at=now,
+                )
+                db.add(version)
+                await db.commit()
+                await db.refresh(document)
+                await db.refresh(version)
+                return (
+                    KnowledgeFileModel.model_validate(document),
+                    KnowledgeFileVersionModel.model_validate(version),
+                )
+            except Exception as e:
+                log.exception(e)
+                await db.rollback()
                 return None
+
+    async def add_version(
+        self,
+        knowledge_file_id: str,
+        file_id: str,
+        author_id: str,
+        comment: Optional[str] = None,
+        approved: bool = False,
+        db: Optional[AsyncSession] = None,
+    ) -> Optional[KnowledgeFileVersionModel]:
+        """Append a new revision to an existing document."""
+        now = int(time.time())
+        async with get_async_db_context(db) as db:
+            try:
+                result = await db.execute(
+                    select(func.max(KnowledgeFileVersion.version_no)).filter(
+                        KnowledgeFileVersion.knowledge_file_id == knowledge_file_id
+                    )
+                )
+                next_no = (result.scalar() or 0) + 1
+
+                version = KnowledgeFileVersion(
+                    id=str(uuid.uuid4()),
+                    knowledge_file_id=knowledge_file_id,
+                    version_no=next_no,
+                    file_id=file_id,
+                    author_id=author_id,
+                    status=VERSION_STATUS_APPROVED if approved else VERSION_STATUS_PENDING,
+                    comment=comment,
+                    reviewed_by=author_id if approved else None,
+                    reviewed_at=now if approved else None,
+                    created_at=now,
+                )
+                db.add(version)
+                await db.commit()
+                await db.refresh(version)
+                return KnowledgeFileVersionModel.model_validate(version)
+            except Exception as e:
+                log.exception(e)
+                await db.rollback()
+                return None
+
+    async def get_versions(
+        self, knowledge_file_id: str, db: Optional[AsyncSession] = None
+    ) -> list[KnowledgeFileVersionModel]:
+        """Full history, newest version first — what «История» renders."""
+        async with get_async_db_context(db) as db:
+            result = await db.execute(
+                select(KnowledgeFileVersion)
+                .filter(KnowledgeFileVersion.knowledge_file_id == knowledge_file_id)
+                .order_by(KnowledgeFileVersion.version_no.desc())
+            )
+            return [KnowledgeFileVersionModel.model_validate(v) for v in result.scalars().all()]
+
+    async def get_version_by_id(
+        self, version_id: str, db: Optional[AsyncSession] = None
+    ) -> Optional[KnowledgeFileVersionModel]:
+        async with get_async_db_context(db) as db:
+            result = await db.execute(select(KnowledgeFileVersion).filter_by(id=version_id))
+            version = result.scalars().first()
+            return KnowledgeFileVersionModel.model_validate(version) if version else None
+
+    async def get_latest_version(
+        self, knowledge_file_id: str, db: Optional[AsyncSession] = None
+    ) -> Optional[KnowledgeFileVersionModel]:
+        async with get_async_db_context(db) as db:
+            result = await db.execute(
+                select(KnowledgeFileVersion)
+                .filter(KnowledgeFileVersion.knowledge_file_id == knowledge_file_id)
+                .order_by(KnowledgeFileVersion.version_no.desc())
+                .limit(1)
+            )
+            version = result.scalars().first()
+            return KnowledgeFileVersionModel.model_validate(version) if version else None
+
+    async def get_pending_versions(
+        self, knowledge_id: str, db: Optional[AsyncSession] = None
+    ) -> list[tuple[KnowledgeFileVersionModel, KnowledgeFileModel]]:
+        """Every version awaiting review in a knowledge base — the reviewer queue."""
+        async with get_async_db_context(db) as db:
+            result = await db.execute(
+                select(KnowledgeFileVersion, KnowledgeFile)
+                .join(KnowledgeFile, KnowledgeFile.id == KnowledgeFileVersion.knowledge_file_id)
+                .filter(
+                    KnowledgeFile.knowledge_id == knowledge_id,
+                    KnowledgeFileVersion.status == VERSION_STATUS_PENDING,
+                )
+                .order_by(KnowledgeFileVersion.created_at.asc())
+            )
+            return [
+                (
+                    KnowledgeFileVersionModel.model_validate(v),
+                    KnowledgeFileModel.model_validate(d),
+                )
+                for v, d in result.all()
+            ]
+
+    async def set_version_status(
+        self,
+        version_id: str,
+        status: VersionStatus,
+        reviewer_id: str,
+        review_note: Optional[str] = None,
+        db: Optional[AsyncSession] = None,
+    ) -> Optional[KnowledgeFileVersionModel]:
+        async with get_async_db_context(db) as db:
+            try:
+                await db.execute(
+                    update(KnowledgeFileVersion)
+                    .filter_by(id=version_id)
+                    .values(
+                        status=status,
+                        review_note=review_note,
+                        reviewed_by=reviewer_id,
+                        reviewed_at=int(time.time()),
+                    )
+                )
+                await db.commit()
+                return await self.get_version_by_id(version_id, db=db)
+            except Exception as e:
+                log.exception(e)
+                await db.rollback()
+                return None
+
+    async def publish_version(
+        self, knowledge_file_id: str, file_id: Optional[str], db: Optional[AsyncSession] = None
+    ) -> Optional[KnowledgeFileModel]:
+        """Point a document at a version's file — the single act that exposes
+        content to the model. ``file_id=None`` unpublishes the document."""
+        async with get_async_db_context(db) as db:
+            try:
+                await db.execute(
+                    update(KnowledgeFile)
+                    .filter_by(id=knowledge_file_id)
+                    .values(file_id=file_id, updated_at=int(time.time()))
+                )
+                await db.commit()
+                result = await db.execute(select(KnowledgeFile).filter_by(id=knowledge_file_id))
+                document = result.scalars().first()
+                return KnowledgeFileModel.model_validate(document) if document else None
+            except Exception as e:
+                log.exception(e)
+                await db.rollback()
+                return None
+
+    async def get_document_by_id(
+        self, knowledge_file_id: str, db: Optional[AsyncSession] = None
+    ) -> Optional[KnowledgeFileModel]:
+        async with get_async_db_context(db) as db:
+            result = await db.execute(select(KnowledgeFile).filter_by(id=knowledge_file_id))
+            document = result.scalars().first()
+            return KnowledgeFileModel.model_validate(document) if document else None
+
+    async def get_document_by_file_id(
+        self, knowledge_id: str, file_id: str, db: Optional[AsyncSession] = None
+    ) -> Optional[KnowledgeFileModel]:
+        """Find the document that owns a file, through any of its versions."""
+        async with get_async_db_context(db) as db:
+            result = await db.execute(
+                select(KnowledgeFile)
+                .join(KnowledgeFileVersion, KnowledgeFileVersion.knowledge_file_id == KnowledgeFile.id)
+                .filter(
+                    KnowledgeFile.knowledge_id == knowledge_id,
+                    KnowledgeFileVersion.file_id == file_id,
+                )
+                .limit(1)
+            )
+            document = result.scalars().first()
+            return KnowledgeFileModel.model_validate(document) if document else None
 
     async def has_file(self, knowledge_id: str, file_id: str, db: Optional[AsyncSession] = None) -> bool:
         """Check whether a file belongs to a knowledge base."""
