@@ -2467,10 +2467,31 @@ async def move_file_in_knowledge(
 
 
 async def _load_kb_for(id: str, user, permission: str, db: AsyncSession):
-    """Fetch a knowledge base and assert the caller's grant on it."""
+    """Fetch a knowledge base and assert the caller may use the review surface on it.
+
+    TWO checks, and the permission one is not redundant. Every route that goes
+    through here belongs to the document registry — the version history, the
+    pending queue, the per-version content and download, the document list. The
+    grant alone no longer separates those from an ordinary user: the seeded base
+    carries a public ('user', '*') read grant, because that is the only way a
+    normal user's chat can retrieve from it at all (see SEED_KNOWLEDGE_BASES).
+
+    So the grant answers "may this content reach you", and workspace.knowledge
+    answers "may you see the workflow around it". Both tiers carry the key and
+    admins bypass, so this changes nothing for the people the screen is for.
+
+    Checked here rather than at each of the nine call sites for the same reason
+    add_file_to_knowledge_by_id is the single chokepoint for attaching a file: a
+    route added later inherits the rule instead of having to remember it.
+    """
     knowledge = await Knowledges.get_knowledge_by_id(id=id, db=db)
     if not knowledge:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    if user.role != 'admin' and not await has_permission(
+        user.id, 'workspace.knowledge', await Config.get('user.permissions'), db=db
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
 
     if (
         user.role != 'admin'

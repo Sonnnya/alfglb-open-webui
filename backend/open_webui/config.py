@@ -126,6 +126,19 @@ SEED_KNOWLEDGE_BASES = {
         ),
         'meta': {'system': True},
         'grants': [
+            # Public read. Not cosmetic — it is the ONLY mechanism by which an
+            # ordinary user's chat can retrieve from this base: both retrieval
+            # paths resolve a model's meta.knowledge through has_access(...,
+            # 'read') on the *chatting* user (tools/builtin.py query_knowledge_files
+            # and retrieval/utils.py get_sources_from_items), and neither honours
+            # BYPASS_RETRIEVAL_ACCESS_CONTROL for a collection. Without this the
+            # base is attached to every model and returns nothing for anyone
+            # outside the two tiers.
+            #
+            # It does NOT open the review surface: _load_kb_for in
+            # routers/knowledge.py additionally requires workspace.knowledge, so
+            # the document registry stays with the tiers and admins.
+            ('user', '*', 'read'),
             ('group', EXPERT_GROUP_ID, 'read'),
             ('group', EXPERT_GROUP_ID, 'write'),  # =proposing file, but file shouldn't go in vector db before approval
             ('group', MASTER_EXPERT_GROUP_ID, 'read'),
