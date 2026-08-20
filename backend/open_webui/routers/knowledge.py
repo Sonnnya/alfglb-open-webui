@@ -2469,16 +2469,16 @@ async def move_file_in_knowledge(
 async def _load_kb_for(id: str, user, permission: str, db: AsyncSession):
     """Fetch a knowledge base and assert the caller may use the review surface on it.
 
-    TWO checks, and the permission one is not redundant. Every route that goes
-    through here belongs to the document registry — the version history, the
-    pending queue, the per-version content and download, the document list. The
-    grant alone no longer separates those from an ordinary user: the seeded base
-    carries a public ('user', '*') read grant, because that is the only way a
-    normal user's chat can retrieve from it at all (see SEED_KNOWLEDGE_BASES).
+    Two checks. The grant one carries the weight: welding-kb's public grant is
+    RETRIEVE_PERMISSION, not 'read', so an ordinary user fails it here exactly as
+    they fail it in has_access_to_file — the registry, «История», the pending
+    queue and the per-version download all stay shut without a special case.
 
-    So the grant answers "may this content reach you", and workspace.knowledge
-    answers "may you see the workflow around it". Both tiers carry the key and
-    admins bypass, so this changes nothing for the people the screen is for.
+    The workspace.knowledge check on top is defence in depth, and mirrors the UI:
+    workspace/+layout.svelte bounces a non-admin without that key, so the two
+    agree about who the screen is for. It also means a plain 'read' grant handed
+    to someone later (an auditor, say) lets them read the base without silently
+    handing them the review workflow.
 
     Checked here rather than at each of the nine call sites for the same reason
     add_file_to_knowledge_by_id is the single chokepoint for attaching a file: a

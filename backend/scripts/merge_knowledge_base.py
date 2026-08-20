@@ -40,8 +40,6 @@ import logging
 import sys
 import time
 from types import SimpleNamespace
-from typing import Optional
-
 import sqlalchemy as sa
 
 log = logging.getLogger('merge_knowledge_base')
@@ -103,7 +101,7 @@ async def _report(db, source_id: str, target_id: str):
     return movable, collisions, empty
 
 
-async def _move(db, documents, target_id: str, reviewer_id: Optional[str]):
+async def _move(db, documents, target_id: str, reviewer_id: str | None):
     from open_webui.models.knowledge import KnowledgeFile, KnowledgeFileVersion
 
     now = int(time.time())
@@ -243,7 +241,7 @@ async def main() -> int:
             print(f'«{source.name}» -> «{target.name}»')
             print('')
 
-            movable, _collisions, _empty = await _report(db, args.source, args.target)
+            movable = (await _report(db, args.source, args.target))[0]
 
             # process_file looks a file up by owner unless the caller is an admin,
             # and the files being moved belong to whoever originally uploaded them.

@@ -26,6 +26,9 @@ from open_webui.env import (
     WEBUI_NAME,
     log,
 )
+
+# access_grants imports only internal.db, so this cannot cycle back through config.
+from open_webui.models.access_grants import RETRIEVE_PERMISSION
 from open_webui.models.config import Config
 from open_webui.models.groups import Groups
 
@@ -126,19 +129,21 @@ SEED_KNOWLEDGE_BASES = {
         ),
         'meta': {'system': True},
         'grants': [
-            # Public read. Not cosmetic — it is the ONLY mechanism by which an
-            # ordinary user's chat can retrieve from this base: both retrieval
-            # paths resolve a model's meta.knowledge through has_access(...,
-            # 'read') on the *chatting* user (tools/builtin.py query_knowledge_files
-            # and retrieval/utils.py get_sources_from_items), and neither honours
-            # BYPASS_RETRIEVAL_ACCESS_CONTROL for a collection. Without this the
-            # base is attached to every model and returns nothing for anyone
-            # outside the two tiers.
+            # Public RETRIEVE, deliberately not 'read'. Both retrieval paths
+            # resolve a model's meta.knowledge against the *chatting* user
+            # (tools/builtin.py query_knowledge_files, retrieval/utils.py
+            # get_sources_from_items) and neither honours
+            # BYPASS_RETRIEVAL_ACCESS_CONTROL for a collection, so without a
+            # public grant the base is attached to every model and returns
+            # nothing for anyone outside the two tiers.
             #
-            # It does NOT open the review surface: _load_kb_for in
-            # routers/knowledge.py additionally requires workspace.knowledge, so
-            # the document registry stays with the tiers and admins.
-            ('user', '*', 'read'),
+            # 'read' would have been too much: it is also what has_access_to_file
+            # consults, so it would let any verified user download the source
+            # documents through GET /files/{id}/content. RETRIEVE_PERMISSION is
+            # honoured only by has_retrieval_access, which only those two paths
+            # call — the model can answer from the base, nobody can enumerate or
+            # extract it. See models/access_grants.py.
+            ('user', '*', RETRIEVE_PERMISSION),
             ('group', EXPERT_GROUP_ID, 'read'),
             ('group', EXPERT_GROUP_ID, 'write'),  # =proposing file, but file shouldn't go in vector db before approval
             ('group', MASTER_EXPERT_GROUP_ID, 'read'),

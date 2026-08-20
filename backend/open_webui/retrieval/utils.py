@@ -1469,14 +1469,16 @@ async def get_sources_from_items(
             # Manual Full Mode Toggle for Collection
             knowledge_base = await Knowledges.get_knowledge_by_id(item.get('id'))
 
+            # has_retrieval_access, not has_access('read'): a base may be attached
+            # to a model for a user who is allowed to be ANSWERED from it without
+            # being allowed to open it. See RETRIEVE_PERMISSION.
             if knowledge_base and (
                 user.role == 'admin'
                 or knowledge_base.user_id == user.id
-                or await AccessGrants.has_access(
+                or await AccessGrants.has_retrieval_access(
                     user_id=user.id,
                     resource_type='knowledge',
                     resource_id=knowledge_base.id,
-                    permission='read',
                 )
             ):
                 if (knowledge_base.meta or {}).get('source') == 'external':
@@ -1494,11 +1496,10 @@ async def get_sources_from_items(
                         if knowledge_base and (
                             user.role == 'admin'
                             or knowledge_base.user_id == user.id
-                            or await AccessGrants.has_access(
+                            or await AccessGrants.has_retrieval_access(
                                 user_id=user.id,
                                 resource_type='knowledge',
                                 resource_id=knowledge_base.id,
-                                permission='read',
                             )
                         ):
                             files = await Knowledges.get_files_by_id(knowledge_base.id)

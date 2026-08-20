@@ -2562,14 +2562,20 @@ async def query_knowledge_files(
                 if item_type == 'collection':
                     # Knowledge base - use KB ID as collection name
                     knowledge = await Knowledges.get_knowledge_by_id(item_id)
+                    # has_retrieval_access, not has_access('read'). This is the one
+                    # place a RETRIEVE_PERMISSION grant has to be honoured: it is
+                    # what lets a model answer from welding-kb for an ordinary user
+                    # who may not open or download it. The sibling tools in this
+                    # file (list_knowledge, view_knowledge_file, search_knowledge_files)
+                    # deliberately keep asking for 'read' — enumerating and fetching
+                    # whole files is exactly what 'retrieve' withholds.
                     if knowledge and (
                         user_role == 'admin'
                         or knowledge.user_id == user_id
-                        or await AccessGrants.has_access(
+                        or await AccessGrants.has_retrieval_access(
                             user_id=user_id,
                             resource_type='knowledge',
                             resource_id=knowledge.id,
-                            permission='read',
                             user_group_ids=set(user_group_ids),
                         )
                     ):

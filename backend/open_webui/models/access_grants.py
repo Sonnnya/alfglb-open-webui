@@ -40,6 +40,18 @@ class AccessGrant(Base):
     )
 
 
+# The permissions the HTTP access editor can express. normalize_access_grants
+# refuses anything else, so any other value is by definition system-managed.
+API_PERMISSIONS = ('read', 'write')
+
+# 'retrieve' means: a model may answer FROM this resource for you, but you may
+# not open, list or download it yourself. It exists because 'read' conflates the
+# two, and welding-kb needs exactly the first for everybody and the second for
+# the expert tiers only. Only the startup seeder can mint it.
+RETRIEVE_PERMISSION = 'retrieve'
+RETRIEVAL_PERMISSIONS = ('read', RETRIEVE_PERMISSION)
+
+
 class AccessGrantModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -409,9 +421,16 @@ class AccessGrantsTable:
         """
         async with get_async_db_context(db) as db:
             await db.execute(
-                delete(AccessGrant).filter_by(
-                    resource_type=resource_type,
-                    resource_id=resource_id,
+                delete(AccessGrant).filter(
+                    AccessGrant.resource_type == resource_type,
+                    AccessGrant.resource_id == resource_id,
+                    # Scoped to what the caller could have sent. normalize_access_grants
+                    # drops any other permission, so a blanket delete here would let the
+                    # access modal silently destroy a system-managed grant it cannot
+                    # rebuild — for welding-kb that is the public 'retrieve' grant, and
+                    # losing it breaks retrieval for every ordinary user until the next
+                    # boot re-seeds it.
+                    AccessGrant.permission.in_(API_PERMISSIONS),
                 )
             )
 
@@ -553,6 +572,61 @@ class AccessGrantsTable:
             )
             grant = result.scalars().first()
             return grant is not None
+
+    async def has_retrieval_access(
+        self,
+        user_id: str,
+        resource_type: str,
+        resource_id: str,
+        user_group_ids: Optional[set[str]] = None,
+        db: Optional[AsyncSession] = None,
+    ) -> bool:
+        """True if the user may have a model answer from this resource.
+
+        Satisfied by a plain 'read' grant OR by the weaker RETRIEVE_PERMISSION.
+        Call this ONLY from the paths that feed a model — retrieval/utils.py's
+        collection branch and the query_knowledge_files builtin. Every other
+        consumer must keep asking for 'read', which is what stops a retrieve-only
+        user from listing the base, opening the registry, or downloading the
+        files (has_access_to_file checks 'read', so it closes automatically).
+        """
+        async with get_async_db_context(db) as db:
+            conditions = [
+                and_(
+                    AccessGrant.principal_type == 'user',
+                    AccessGrant.principal_id == '*',
+                ),
+                and_(
+                    AccessGrant.principal_type == 'user',
+                    AccessGrant.principal_id == user_id,
+                ),
+            ]
+
+            if user_group_ids is None:
+                from open_webui.models.groups import Groups
+
+                user_groups = await Groups.get_groups_by_member_id(user_id, db=db)
+                user_group_ids = {group.id for group in user_groups}
+
+            if user_group_ids:
+                conditions.append(
+                    and_(
+                        AccessGrant.principal_type == 'group',
+                        AccessGrant.principal_id.in_(user_group_ids),
+                    )
+                )
+
+            result = await db.execute(
+                select(AccessGrant)
+                .filter(
+                    AccessGrant.resource_type == resource_type,
+                    AccessGrant.resource_id == resource_id,
+                    AccessGrant.permission.in_(RETRIEVAL_PERMISSIONS),
+                    or_(*conditions),
+                )
+                .limit(1)
+            )
+            return result.scalars().first() is not None
 
     async def get_accessible_resource_ids(
         self,
