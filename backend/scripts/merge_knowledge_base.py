@@ -302,6 +302,15 @@ async def _drop_source(db, source_id: str):
     from open_webui.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
     from open_webui.routers.knowledge import remove_knowledge_base_metadata_embedding
 
+    # Say what the DATABASE will do, not just what this function does. Deleting
+    # the knowledge row takes its whole subtree with it through ON DELETE CASCADE
+    # (models/knowledge.py:78 and :115) - which is how the folder names were lost
+    # the first time this ran. Nothing in Python is involved, so nothing in Python
+    # can report it after the fact; it has to be counted before.
+    directories = await Knowledges.get_all_directories(source_id, db=db)
+    remaining = await _fetch_documents(db, source_id)
+    print(f'  cascade will also delete {len(directories)} folder row(s) and {len(remaining)} document row(s)')
+
     # The same refusal DELETE /knowledge/{id} makes, and for the same reason: a
     # seeded base is not the operator's to remove. Reachable by getting --source
     # and --target the wrong way round, which would otherwise delete welding-kb
@@ -400,20 +409,35 @@ async def main() -> int:
             )
             print(f'  {created} folder(s) created')
 
-            if not movable:
-                print('')
+            failed = []
+            if movable:
+                print(f'Moving {len(movable)} document(s)...')
+                await _move(db, movable, args.target, reviewer_id or None, directory_map)
+
+                print('Re-embedding into the target collection...')
+                failed = await _reembed(request, movable, args.target, actor, db)
+            else:
                 print('No documents to move.')
-                return 0
-
-            print(f'Moving {len(movable)} document(s)...')
-            await _move(db, movable, args.target, reviewer_id or None, directory_map)
-
-            print('Re-embedding into the target collection...')
-            failed = await _reembed(request, movable, args.target, actor, db)
 
             if args.delete_source:
-                print(f'Removing the emptied base {args.source}...')
-                await _drop_source(db, args.source)
+                if movable:
+                    # THE GUARD. Moving is reversible; deleting the source is not,
+                    # and it takes the source's folder rows with it through
+                    # ON DELETE CASCADE - which is exactly how the folder names
+                    # were lost the first time this script ran on stage, in a
+                    # single --apply --delete-source invocation.
+                    #
+                    # So the two halves cannot share a run any more. Move, look at
+                    # the result in the UI, then re-run the same command: with
+                    # nothing left to move, the delete goes ahead.
+                    print('')
+                    print(f'NOT deleting {args.source}: this run just moved {len(movable)} document(s).')
+                    print("That delete is irreversible and cascades to the source's folder rows,")
+                    print('so nothing can put them back. Check the documents in the UI first, then')
+                    print('re-run this exact command - with nothing left to move it will delete.')
+                else:
+                    print(f'Removing the emptied base {args.source}...')
+                    await _drop_source(db, args.source)
 
             print('')
             print(f'Done. {len(movable) - len(failed)} document(s) moved and embedded.')
