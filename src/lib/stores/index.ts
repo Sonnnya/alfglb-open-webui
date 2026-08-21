@@ -125,6 +125,34 @@ export const desktopEvent: Writable<DesktopEvent | null> = writable(null);
 export const scrollPaginationEnabled = writable(false);
 export const currentChatPage = writable(1);
 
+/**
+ * Bumped whenever a knowledge base directory is created, renamed, moved or
+ * deleted. The sidebar tree (Sidebar/KnowledgeFolders.svelte) refetches on every
+ * change; the knowledge base screen, which owns all four mutations, bumps it.
+ *
+ * A counter rather than the directory list itself: the two components want
+ * different shapes — the screen gets one level at a time from /documents, the
+ * tree wants all of them from /dirs — so sharing the data would mean one of them
+ * holding a projection it never uses. They share the *fact* that it changed.
+ */
+export const knowledgeDirectoryRevision = writable(0);
+
+/**
+ * Which knowledge base folder is open, shared between the sidebar tree and the
+ * knowledge base screen.
+ *
+ * This is deliberately NOT the URL. Routing it through ?dir= and a reactive read
+ * of $page looked cleaner and did not work: SvelteKit's replaceState moves the
+ * address bar, but $page.url does not follow synchronously, so the guard
+ * comparing the two re-applied the *previous* folder and the panel snapped back
+ * to root while the URL showed the folder you had clicked.
+ *
+ * A store has no such lag — set() runs subscribers immediately — so the screen
+ * can set its own state and publish here in the same tick, and its watcher sees
+ * the two already agreeing. ?dir= survives as a read-once deep link.
+ */
+export const activeKnowledgeDirectoryId: Writable<string | null> = writable(null);
+
 export const isLastActiveTab = writable(true);
 export const playingNotificationSound = writable(false);
 

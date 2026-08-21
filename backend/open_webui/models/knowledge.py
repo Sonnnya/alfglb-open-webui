@@ -320,8 +320,24 @@ class KnowledgeDocumentResponse(BaseModel):
 
 
 class KnowledgeDocumentListResponse(BaseModel):
+    """The registry payload: documents at this level, plus the tree around them.
+
+    directories/breadcrumbs are populated only in *folder mode* (the caller passed
+    a directory_id, even an empty one meaning root). A flat listing spans every
+    folder, so there is no single level to draw and no path to show — that is the
+    shape a search falls back to, deliberately: someone searching wants hits from
+    the whole base, not from the folder they happen to be standing in.
+
+    Carrying them here rather than leaving the client to call GET /{id}/files for
+    the tree keeps one request and one source of truth. /files is published-only,
+    so its file list and this one legitimately disagree; its *directory* list did
+    not, which made the split easy to mistake for redundancy.
+    """
+
     items: list[KnowledgeDocumentResponse]
     total: int
+    directories: list[KnowledgeDirectoryModel] = Field(default_factory=list)
+    breadcrumbs: list[KnowledgeDirectoryModel] = Field(default_factory=list)
 
 
 class KnowledgeFileListResponse(BaseModel):
@@ -1005,7 +1021,19 @@ class KnowledgeTable:
 
             rows = (await db.execute(stmt)).all()
 
+            in_folder_mode = 'directory_id' in filter
             return KnowledgeDocumentListResponse(
+                # Folders ride along on the FIRST page only. They are not paginated —
+                # `total` counts documents — so returning them again on page 2 would
+                # redraw every subfolder above the second page of documents.
+                directories=(
+                    await self.get_directories(knowledge_id, parent_id=directory_id, db=db)
+                    if in_folder_mode and not skip
+                    else []
+                ),
+                # Breadcrumbs, by contrast, belong on every page: the path is where
+                # you are, not what is in front of you.
+                breadcrumbs=(await self.get_directory_breadcrumbs(directory_id, db=db) if in_folder_mode else []),
                 items=[
                     KnowledgeDocumentResponse(
                         document_id=document.id,
@@ -1368,6 +1396,63 @@ class KnowledgeTable:
             ).scalar() or 0
             return remaining
 
+    async def get_documents_in_subtree(self, directory_id: str, db: Optional[AsyncSession] = None) -> list[str]:
+        """Every document id under a directory, including nested ones.
+
+        Used when a folder is deleted *with* its contents: the caller has to purge
+        each document through the normal path (history + vector chunks), which
+        _delete_files_in_subtree never did — it dropped knowledge_file rows and
+        left both behind.
+        """
+        async with get_async_db_context(db) as db:
+            pending = [directory_id]
+            seen: set[str] = set()
+            document_ids: list[str] = []
+
+            while pending:
+                current = pending.pop()
+                if current in seen:
+                    continue
+                seen.add(current)
+
+                rows = (await db.execute(select(KnowledgeFile.id).filter_by(directory_id=current))).scalars().all()
+                document_ids.extend(rows)
+
+                children = (
+                    (await db.execute(select(KnowledgeDirectory.id).filter_by(parent_id=current))).scalars().all()
+                )
+                pending.extend(children)
+
+            return document_ids
+
+    async def move_document_to_directory(
+        self,
+        knowledge_id: str,
+        document_id: str,
+        directory_id: Optional[str] = None,
+        db: Optional[AsyncSession] = None,
+    ) -> bool:
+        """Move a document by its own id rather than its published file's.
+
+        move_file_to_directory keys on knowledge_file.file_id, which is NULL until
+        a version is approved — so it silently matches nothing for a document still
+        awaiting review, and the route 404s. Filing a document before it is approved
+        is exactly what an Эксперт wants to do, hence this.
+        """
+        async with get_async_db_context(db) as db:
+            try:
+                result = await db.execute(
+                    update(KnowledgeFile)
+                    .filter_by(id=document_id, knowledge_id=knowledge_id)
+                    .values(directory_id=directory_id, updated_at=int(time.time()))
+                )
+                await db.commit()
+                return result.rowcount > 0
+            except Exception as e:
+                log.exception(e)
+                await db.rollback()
+                return False
+
     async def reset_knowledge_by_id(
         self, id: str, include_directories: bool = True, db: Optional[AsyncSession] = None
     ) -> Optional[KnowledgeModel]:
@@ -1693,13 +1778,25 @@ class KnowledgeTable:
                     # Delete files in this directory and all subdirectories
                     await self._delete_files_in_subtree(directory_id, db=db)
 
-                # CASCADE on parent_id will handle deleting subdirectories
+                # Children are removed explicitly rather than left to the
+                # ondelete='CASCADE' on knowledge_directory.parent_id: SQLite honours
+                # that only with PRAGMA foreign_keys ON, so a nested folder would
+                # linger in dev and vanish in the Postgres deployment. Same rule
+                # delete_document follows for version rows.
+                await self._delete_directory_subtree(directory_id, db=db)
                 await db.execute(delete(KnowledgeDirectory).filter_by(id=directory_id))
                 await db.commit()
                 return True
             except Exception as e:
                 log.exception(e)
                 return False
+
+    async def _delete_directory_subtree(self, directory_id: str, db: AsyncSession) -> None:
+        """Remove every directory nested under this one, depth first."""
+        children = (await db.execute(select(KnowledgeDirectory.id).filter_by(parent_id=directory_id))).scalars().all()
+        for child_id in children:
+            await self._delete_directory_subtree(child_id, db=db)
+            await db.execute(delete(KnowledgeDirectory).filter_by(id=child_id))
 
     async def _move_files_from_subtree(
         self,

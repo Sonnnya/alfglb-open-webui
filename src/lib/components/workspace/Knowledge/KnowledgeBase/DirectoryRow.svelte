@@ -58,7 +58,7 @@
 
 <!-- svelte-ignore a11y-no-static-element-interactions -->
 <div
-	class="group flex cursor-pointer w-full px-2 bg-transparent dark:hover:bg-gray-850/50 hover:bg-white rounded-xl transition
+	class="group flex items-center gap-2.5 cursor-pointer w-full bg-transparent dark:hover:bg-gray-850/50 hover:bg-white rounded-xl transition
 		{dragOver
 		? 'bg-gray-100 dark:bg-gray-800 ring-1 ring-gray-300 dark:ring-gray-600'
 		: 'hover:bg-gray-100 dark:hover:bg-gray-850'}"
@@ -103,18 +103,18 @@
 		}
 	}}
 >
-	<div class="flex items-center">
-		<button
-			class="p-1 rounded-full transition"
-			type="button"
-			on:click={() => onNavigate(directory.id)}
-		>
-			<Folder className="size-3.5" />
-		</button>
-	</div>
+	<!-- Sized and inset to match the document rows this now sits above in
+	     DocumentRegistry: same size-4 glyph, same text-gray-500, and no padding of
+	     its own so both icons share one left edge. It used to be a size-3.5 glyph
+	     inside a p-1 button inside a px-2 row — 2px smaller and 12px further in,
+	     which read as a wobble down the column. gap-2.5 on the row (above) is the
+	     document row's gap, so the labels line up too. -->
+	<button class="text-gray-500 shrink-0" type="button" on:click={() => onNavigate(directory.id)}>
+		<Folder className="size-4" />
+	</button>
 
 	<button
-		class="relative flex items-center gap-1 rounded-xl p-2 text-left flex-1 justify-between"
+		class="relative flex items-center gap-1 rounded-xl text-left flex-1 justify-between"
 		type="button"
 		on:click={() => {
 			if (editing) return;

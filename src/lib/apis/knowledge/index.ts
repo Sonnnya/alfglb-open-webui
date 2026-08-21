@@ -1099,6 +1099,83 @@ export const deleteKnowledgeDirectory = async (
 	return res;
 };
 
+/**
+ * Move a DOCUMENT into a directory.
+ *
+ * Separate from moveFileInKnowledge because that one keys on the published
+ * file_id, and a document awaiting its first approval has none — knowledge_file.file_id
+ * is NULL until a version is published, so the file-keyed route 404s on exactly
+ * the documents an Эксперт most wants to file away. Same endpoint, different key.
+ */
+/**
+ * The whole directory tree of a knowledge base, flat, each row carrying parent_id.
+ *
+ * Not the same as the `directories` on getKnowledgeDocuments — that is one level
+ * and only on page 1, which is right for the registry and useless for a tree.
+ */
+export const getKnowledgeDirectories = async (token: string, id: string) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/knowledge/${id}/dirs`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			authorization: `Bearer ${token}`
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail;
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+export const moveDocumentInKnowledge = async (
+	token: string,
+	id: string,
+	documentId: string,
+	directoryId?: string | null
+) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/knowledge/${id}/file/move`, {
+		method: 'POST',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			authorization: `Bearer ${token}`
+		},
+		body: JSON.stringify({
+			document_id: documentId,
+			directory_id: directoryId ?? null
+		})
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail;
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
 export const moveFileInKnowledge = async (
 	token: string,
 	id: string,

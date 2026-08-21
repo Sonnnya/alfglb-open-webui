@@ -58,7 +58,7 @@
 	import { updateUserSettings } from '$lib/apis/users';
 	import { checkActiveChats } from '$lib/apis/tasks';
 	import { createNoteHandler } from '$lib/components/notes/utils';
-	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
+	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WELDING_KB_ID } from '$lib/constants';
 
 	import ArchivedChatsModal from './ArchivedChatsModal.svelte';
 	import UserMenu from './Sidebar/UserMenu.svelte';
@@ -68,6 +68,7 @@
 	import Folder from '../common/Folder.svelte';
 	import Tooltip from '../common/Tooltip.svelte';
 	import Folders from './Sidebar/Folders.svelte';
+	import KnowledgeFolders from './Sidebar/KnowledgeFolders.svelte';
 	import SharedFolderItem from './Sidebar/SharedFolderItem.svelte';
 	import { getChannels, createNewChannel } from '$lib/apis/channels';
 	import ChannelModal from './Sidebar/ChannelModal.svelte';
@@ -1258,6 +1259,16 @@
 							{/if}
 						{/each}
 					</Folder>
+				{/if}
+
+				<!-- The welding knowledge base's own directory tree, in the slot the chat
+				     «Папки» below used to occupy (they are off — ENABLE_FOLDERS defaults to
+				     False in config.py). Same audience as the «База знаний» menu entry, and
+				     deliberately the same expression as isMenuItemVisible('knowledge') in
+				     utils/menu-items.ts — if the two ever disagree the tree becomes a list of
+				     folder names for a base the viewer cannot open. -->
+				{#if $user?.role === 'admin' || $user?.permissions?.workspace?.knowledge}
+					<KnowledgeFolders knowledgeId={WELDING_KB_ID} />
 				{/if}
 
 				{#if $config?.features?.enable_folders && ($user?.role === 'admin' || ($user?.permissions?.features?.folders ?? true))}

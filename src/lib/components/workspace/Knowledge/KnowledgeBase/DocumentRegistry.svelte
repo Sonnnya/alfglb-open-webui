@@ -35,6 +35,7 @@
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Badge from '$lib/components/common/Badge.svelte';
 	import DocumentPage from '$lib/components/icons/DocumentPage.svelte';
+	import DirectoryRow from './DirectoryRow.svelte';
 
 	// Typed rather than the bare getContext('i18n') used elsewhere: untyped, every
 	// $i18n.t() call raises "Cannot use 'i18n' as a store" under svelte-check.
@@ -60,6 +61,30 @@
 	 * knowledge base) and this one. The parent's box now drives this instead.
 	 */
 	export let query = '';
+	/**
+	 * The folder being shown. `null` means the root level; the registry is then a
+	 * file manager rather than a flat list.
+	 *
+	 * A search overrides it — see load(): people searching want hits from the whole
+	 * base, not from the folder they happen to be standing in, so a non-empty query
+	 * drops the scoping and the folder rows with it.
+	 */
+	export let directoryId: string | null = null;
+	/** Whether the viewer may create, rename, move or delete folders. */
+	export let writeAccess = false;
+
+	export let onNavigate: (directoryId: string | null) => void = () => {};
+	export let onRenameDirectory: (directoryId: string, name: string) => void = () => {};
+	export let onDeleteDirectory: (directoryId: string) => void = () => {};
+	export let onMoveDirectory: (directoryId: string, targetId: string | null) => void = () => {};
+	export let onMoveDocument: (documentId: string, targetId: string | null) => void = () => {};
+	/**
+	 * Reports the folder path back to the parent, which draws the breadcrumbs above
+	 * this component. Sent from here because /documents is what actually knows it —
+	 * the parent's legacy /files call also returns a path, but it is fetched on a
+	 * different trigger and would drift on a search, where scoping is dropped.
+	 */
+	export let onTree: (breadcrumbs: any[]) => void = () => {};
 
 	// Must match DOCUMENT_REGISTRY_PAGE_COUNT in backend/open_webui/routers/knowledge.py —
 	// the server decides how many rows come back, this only decides whether to draw
@@ -67,6 +92,7 @@
 	const PER_PAGE = 10;
 
 	let documents: any[] = [];
+	let directories: any[] = [];
 	let total = 0;
 	let page = 1;
 	let loading = true;
@@ -78,8 +104,13 @@
 
 	const load = async () => {
 		loading = true;
+		// directoryId is sent as '' for the root — the API distinguishes "omitted"
+		// (flat across every folder) from "explicitly root". A search deliberately
+		// omits it so results span the whole base.
+		const searching = (query ?? '').trim().length > 0;
 		const res = await getKnowledgeDocuments(localStorage.token, knowledgeId, {
 			query: query || undefined,
+			directoryId: searching ? undefined : (directoryId ?? ''),
 			page
 		}).catch((e) => {
 			toast.error(`${e}`);
@@ -88,7 +119,14 @@
 
 		if (res) {
 			documents = res.items ?? [];
+			// Folders come back only in folder mode AND only on page 1, so a search
+			// empties this by itself and the list reads as a flat result set.
+			directories = res.directories ?? [];
 			total = res.total ?? 0;
+			// Empty while searching, which is what clears the breadcrumb — showing
+			// «База знаний / ГОСТы» above results gathered from the whole base
+			// would be a straightforward lie about what is on screen.
+			onTree(res.breadcrumbs ?? []);
 		}
 		loading = false;
 	};
@@ -101,6 +139,16 @@
 
 	// Debounced here rather than in the parent: the parent's handler also refetches
 	// the legacy /files list, and the two want different timing.
+	let appliedDirectoryId = directoryId;
+	$: if (directoryId !== appliedDirectoryId) {
+		appliedDirectoryId = directoryId;
+		if (page !== 1) {
+			page = 1;
+		} else {
+			load();
+		}
+	}
+
 	let appliedQuery = query;
 	$: if (query !== appliedQuery) {
 		appliedQuery = query;
@@ -390,12 +438,45 @@
 
 	{#if loading}
 		<div class="flex justify-center py-6"><Spinner className="size-5" /></div>
-	{:else if documents.length === 0 && uploading.length === 0}
+	{:else if documents.length === 0 && directories.length === 0 && uploading.length === 0}
 		<div class="py-6 text-center text-xs text-gray-500">{$i18n.t('No content found')}</div>
 	{:else}
 		<div class="flex flex-col w-full">
-			{#each documents as doc (doc.document_id)}
+			<!-- Folders first, and deliberately OUTSIDE the pager: a level holds a
+			     handful of them, and paging them alongside documents would put
+			     subfolders on page 2 where nobody looks for them. `total` counts
+			     documents only, which is what the server paginates. -->
+			{#each directories as directory (directory.id)}
+				<!-- py-2, matching the document rows below: py-1 made folder rows
+				     visibly shorter than the files under them. -->
 				<div class="w-full border-b border-gray-50 dark:border-gray-850 py-2">
+					<DirectoryRow
+						{directory}
+						{writeAccess}
+						onNavigate={(dirId) => onNavigate(dirId)}
+						onRename={(dirId, name) => onRenameDirectory(dirId, name)}
+						onDelete={(dirId) => onDeleteDirectory(dirId)}
+						onFileDrop={(documentId, dirId) => onMoveDocument(documentId, dirId)}
+						onDirDrop={(dirId, targetId) => onMoveDirectory(dirId, targetId)}
+					/>
+				</div>
+			{/each}
+
+			{#each documents as doc (doc.document_id)}
+				<div
+					class="w-full border-b border-gray-50 dark:border-gray-850 py-2"
+					draggable={writeAccess}
+					on:dragstart={(e) => {
+						if (!writeAccess) return;
+						// Same mime DirectoryRow and KnowledgeBreadcrumbs already listen for,
+						// but the payload carries the DOCUMENT id: a document awaiting review
+						// has no published file to move by. Both consumers just forward it.
+						e.dataTransfer?.setData(
+							'application/x-kb-file-move',
+							JSON.stringify({ fileId: doc.document_id })
+						);
+					}}
+				>
 					<div class="flex items-center gap-2.5 w-full">
 						<div class="text-gray-500 shrink-0">
 							<DocumentPage className="size-4" />

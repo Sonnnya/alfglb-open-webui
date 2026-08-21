@@ -2271,7 +2271,13 @@ class KnowledgeDirectoryUpdateForm(BaseModel):
 
 
 class KnowledgeFileMoveForm(BaseModel):
-    file_id: str
+    # Either identifier works. document_id is the one the registry sends, because
+    # it is the only one that can address a document whose sole version is still
+    # awaiting review — such a document has knowledge_file.file_id = NULL, so
+    # has_file() below matches nothing and the request 404s. file_id is kept for
+    # the older callers (and for upstream compatibility).
+    file_id: Optional[str] = None
+    document_id: Optional[str] = None
     directory_id: Optional[str] = None
 
 
@@ -2301,6 +2307,28 @@ async def _verify_knowledge_write_access(id: str, user, db: AsyncSession):
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
     return knowledge
+
+
+@router.get('/{id}/dirs', response_model=list[KnowledgeDirectoryModel])
+async def list_knowledge_directories(
+    id: str,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Every directory in the base, flat, with parent_id — the sidebar tree.
+
+    Distinct from the `directories` field on GET /{id}/documents, which is one
+    LEVEL (the children of wherever you are standing) and rides page 1 only. A
+    tree needs all of them at once, and it is cheap: these are name+parent rows,
+    not documents.
+
+    Goes through _load_kb_for, so it inherits the registry's audience exactly —
+    read grant plus workspace.knowledge. The sidebar entry is drawn on the same
+    condition, which is what keeps an ordinary user from seeing the shape of a
+    base they cannot open.
+    """
+    await _load_kb_for(id, user, 'read', db)
+    return await Knowledges.get_all_directories(id, db=db)
 
 
 @router.post('/{id}/dirs/create', response_model=KnowledgeDirectoryModel)
@@ -2384,7 +2412,7 @@ async def delete_knowledge_directory(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await _verify_knowledge_write_access(id, user, db)
+    knowledge = await _verify_knowledge_write_access(id, user, db)
 
     # Verify directory belongs to this knowledge base
     directory = await Knowledges.get_directory_by_id(dir_id, db=db)
@@ -2394,9 +2422,42 @@ async def delete_knowledge_directory(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
+    if not move_files:
+        # «Удалить всё содержимое папки». Each document goes through the same purge
+        # as DELETE /{id}/document/{document_id} — history and chunks included.
+        # Doing it here rather than in Knowledges.delete_directory keeps the vector
+        # store out of the model layer, which is where the old leak came from.
+        #
+        # TWO passes, and the split is the point: authorise the whole subtree first,
+        # then destroy. Checking inside the purge loop meant an Эксперт deleting a
+        # folder holding three of their own documents and one of a Мастер's lost
+        # their three and *then* got the 403 — a partial, unrecoverable delete whose
+        # extent depended on the traversal order.
+        document_ids = []
+        may_review = await _may_review(user, db)
+        for document_id in await Knowledges.get_documents_in_subtree(dir_id, db=db):
+            document = await Knowledges.get_document_by_id(document_id, db=db)
+            if not document or document.knowledge_id != id:
+                continue
+            if document.user_id != user.id and not may_review:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=(
+                        'В папке есть документы других пользователей. '
+                        'Удалить их может только Мастер-эксперт или администратор.'
+                    ),
+                )
+            document_ids.append(document_id)
+
+        for document_id in document_ids:
+            await _purge_document(knowledge, document_id, user, True, db)
+
     success = await Knowledges.delete_directory(
         directory_id=dir_id,
-        move_files_to_parent=move_files,
+        # Always True now: with move_files=False the documents are already gone,
+        # and the model layer's own _delete_files_in_subtree is the leaky path
+        # this route exists to avoid.
+        move_files_to_parent=True,
         db=db,
     )
     if not success:
@@ -2424,11 +2485,10 @@ async def move_file_in_knowledge(
 ):
     await _verify_knowledge_write_access(id, user, db)
 
-    # Verify file belongs to this knowledge base
-    if not await Knowledges.has_file(knowledge_id=id, file_id=form_data.file_id, db=db):
+    if not form_data.document_id and not form_data.file_id:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=ERROR_MESSAGES.NOT_FOUND,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Either document_id or file_id is required.',
         )
 
     # If target directory is set, verify it belongs to this knowledge base
@@ -2440,12 +2500,35 @@ async def move_file_in_knowledge(
                 detail='Target directory not found.',
             )
 
-    success = await Knowledges.move_file_to_directory(
-        knowledge_id=id,
-        file_id=form_data.file_id,
-        directory_id=form_data.directory_id,
-        db=db,
-    )
+    if form_data.document_id:
+        # move_document_to_directory scopes to the knowledge base itself, so it is
+        # its own membership check — no has_file() equivalent is needed, and a
+        # document belonging to another base simply matches nothing.
+        document = await Knowledges.get_document_by_id(form_data.document_id, db=db)
+        if not document or document.knowledge_id != id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+        success = await Knowledges.move_document_to_directory(
+            knowledge_id=id,
+            document_id=form_data.document_id,
+            directory_id=form_data.directory_id,
+            db=db,
+        )
+        subject_id = form_data.document_id
+    else:
+        # Verify file belongs to this knowledge base
+        if not await Knowledges.has_file(knowledge_id=id, file_id=form_data.file_id, db=db):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=ERROR_MESSAGES.NOT_FOUND,
+            )
+        success = await Knowledges.move_file_to_directory(
+            knowledge_id=id,
+            file_id=form_data.file_id,
+            directory_id=form_data.directory_id,
+            db=db,
+        )
+        subject_id = form_data.file_id
+
     if not success:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2455,7 +2538,7 @@ async def move_file_in_knowledge(
         request,
         EVENTS.KNOWLEDGE_FILE_MOVED,
         actor=user,
-        subject_id=form_data.file_id,
+        subject_id=subject_id,
         data={'knowledge_id': id, 'directory_id': form_data.directory_id},
     )
     return {'status': True}
@@ -2766,6 +2849,45 @@ async def reject_version(
     )
 
 
+async def _purge_document(knowledge, document_id: str, user, delete_files: bool, db) -> None:
+    """Delete a document, its version history, and everything it left behind.
+
+    Extracted so folder deletion can reuse it. The old path for "delete a folder
+    and its contents" went through Knowledges._delete_files_in_subtree, which
+    removed knowledge_file rows and nothing else: version rows survived (the
+    ondelete='CASCADE' fires on PostgreSQL but not on SQLite without PRAGMA
+    foreign_keys) and, worse, the chunks stayed in the collection — so a deleted
+    folder's documents kept answering the model.
+    """
+    file_ids = await Knowledges.delete_document(document_id, db=db)
+
+    for file_id in file_ids:
+        # By file_id only — never by hash. See the note in /{id}/file/remove.
+        try:
+            await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=knowledge.id, filter={'file_id': file_id})
+        except Exception as e:
+            log.debug(f'No chunks to drop for {file_id}: {e}')
+
+        if not delete_files:
+            continue
+
+        # Same rule /{id}/file/remove applies: drop the underlying file only when
+        # it is the caller's own (or they are an admin). A Мастер-эксперт deleting
+        # someone else's document detaches it without destroying their file.
+        file = await Files.get_file_by_id(file_id, db=db)
+        if not file or not (file.user_id == user.id or user.role == 'admin'):
+            continue
+
+        try:
+            file_collection = f'file-{file_id}'
+            if await ASYNC_VECTOR_DB_CLIENT.has_collection(collection_name=file_collection):
+                await ASYNC_VECTOR_DB_CLIENT.delete_collection(collection_name=file_collection)
+        except Exception as e:
+            log.debug(f'No per-file collection for {file_id}: {e}')
+
+        await Files.delete_file_by_id(file_id, db=db)
+
+
 @router.delete('/{id}/document/{document_id}', response_model=bool)
 async def delete_knowledge_document(
     request: Request,
@@ -2797,33 +2919,7 @@ async def delete_knowledge_document(
     if document.user_id != user.id and not await _may_review(user, db):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
 
-    file_ids = await Knowledges.delete_document(document_id, db=db)
-
-    for file_id in file_ids:
-        # By file_id only — never by hash. See the note in /{id}/file/remove.
-        try:
-            await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=knowledge.id, filter={'file_id': file_id})
-        except Exception as e:
-            log.debug(f'No chunks to drop for {file_id}: {e}')
-
-        if not delete_files:
-            continue
-
-        # Same rule /{id}/file/remove applies: drop the underlying file only when
-        # it is the caller's own (or they are an admin). A Мастер-эксперт deleting
-        # someone else's document detaches it without destroying their file.
-        file = await Files.get_file_by_id(file_id, db=db)
-        if not file or not (file.user_id == user.id or user.role == 'admin'):
-            continue
-
-        try:
-            file_collection = f'file-{file_id}'
-            if await ASYNC_VECTOR_DB_CLIENT.has_collection(collection_name=file_collection):
-                await ASYNC_VECTOR_DB_CLIENT.delete_collection(collection_name=file_collection)
-        except Exception as e:
-            log.debug(f'No per-file collection for {file_id}: {e}')
-
-        await Files.delete_file_by_id(file_id, db=db)
+    await _purge_document(knowledge, document_id, user, delete_files, db)
 
     await publish_event(
         request,

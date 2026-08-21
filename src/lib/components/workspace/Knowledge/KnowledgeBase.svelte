@@ -18,7 +18,9 @@
 		knowledge as _knowledge,
 		config,
 		user,
-		settings
+		settings,
+		knowledgeDirectoryRevision,
+		activeKnowledgeDirectoryId
 	} from '$lib/stores';
 
 	import {
@@ -41,6 +43,7 @@
 		createKnowledgeDirectory,
 		updateKnowledgeDirectory,
 		deleteKnowledgeDirectory,
+		moveDocumentInKnowledge,
 		moveFileInKnowledge,
 		syncKnowledgeDiff,
 		syncKnowledgeCleanup,
@@ -66,6 +69,7 @@
 	import AddContentMenu from './KnowledgeBase/AddContentMenu.svelte';
 	import AddTextContentModal from './KnowledgeBase/AddTextContentModal.svelte';
 	import NewDirectoryModal from './KnowledgeBase/NewDirectoryModal.svelte';
+	import NewFolderAlt from '$lib/components/icons/NewFolderAlt.svelte';
 	import KnowledgeBreadcrumbs from './KnowledgeBase/KnowledgeBreadcrumbs.svelte';
 
 	import SyncConfirmDialog from '../../common/ConfirmDialog.svelte';
@@ -782,7 +786,19 @@
 	};
 
 	// Directory handlers
-	const navigateToDirectory = (directoryId: string | null) => {
+	// ── Which folder is open ──────────────────────────────────────────────
+	//
+	// The URL is the single source of truth, not this component's state. Two
+	// different things navigate — the folder rows in the registry and the sidebar
+	// tree — and neither has a reference to the other; routing both through
+	// ?dir=<id> is what lets them stay in step, and what makes a reload or a
+	// shared link land in the same place.
+	//
+	// This used to be read once in onMount, which meant clicking a folder in the
+	// sidebar while already on this screen changed the address bar and nothing
+	// else: the component is not remounted for a query-string change.
+
+	const applyDirectory = (directoryId: string | null) => {
 		currentDirectoryId = directoryId;
 		currentPage = 1;
 		selectedFileId = null;
@@ -791,6 +807,40 @@
 		loadingFileContent = false;
 		getItemsPage();
 	};
+
+	// The folder rows and the breadcrumbs call this. Same body the pre-registry
+	// version had, plus two lines: publish to the store so the sidebar tree can
+	// highlight, and keep the address bar honest.
+	const navigateToDirectory = (directoryId: string | null) => {
+		applyDirectory(directoryId);
+
+		// set() is synchronous, so by the time the watcher below runs, the store and
+		// currentDirectoryId already agree and it does nothing. That ordering is the
+		// whole reason this is a store and not the URL.
+		activeKnowledgeDirectoryId.set(directoryId);
+		writeDirectoryToUrl(directoryId);
+	};
+
+	// Cosmetic ONLY. Nothing reads this back reactively — a reload or a shared link
+	// picks it up once in onMount and that is all. The previous attempt made the URL
+	// the source of truth via SvelteKit's replaceState, and $page.url lagged behind
+	// the address bar, so the panel bounced back to the folder you had just left.
+	const writeDirectoryToUrl = (directoryId: string | null) => {
+		const url = new URL(window.location.href);
+		if (directoryId) {
+			url.searchParams.set('dir', directoryId);
+		} else {
+			url.searchParams.delete('dir');
+		}
+		history.replaceState(history.state, '', url);
+	};
+
+	// Navigation coming from OUTSIDE this component — the sidebar tree. Compared
+	// against currentDirectoryId so our own navigateToDirectory cannot echo back.
+	$: if (knowledge && $activeKnowledgeDirectoryId !== currentDirectoryId) {
+		applyDirectory($activeKnowledgeDirectoryId);
+		writeDirectoryToUrl($activeKnowledgeDirectoryId);
+	}
 
 	const createDirectoryHandler = async (name: string) => {
 		const res = await createKnowledgeDirectory(
@@ -806,6 +856,9 @@
 		if (res) {
 			toast.success($i18n.t('Directory created.'));
 			getItemsPage();
+			documentRegistry?.refresh();
+			// The sidebar tree reads /dirs and cannot see this any other way.
+			knowledgeDirectoryRevision.update((n) => n + 1);
 		}
 	};
 
@@ -820,6 +873,9 @@
 		if (res) {
 			toast.success($i18n.t('Directory renamed.'));
 			getItemsPage();
+			documentRegistry?.refresh();
+			// The sidebar tree reads /dirs and cannot see this any other way.
+			knowledgeDirectoryRevision.update((n) => n + 1);
 		}
 	};
 
@@ -844,6 +900,9 @@
 		if (res) {
 			toast.success($i18n.t('Directory deleted.'));
 			getItemsPage();
+			documentRegistry?.refresh();
+			// The sidebar tree reads /dirs and cannot see this any other way.
+			knowledgeDirectoryRevision.update((n) => n + 1);
 		}
 		pendingDeleteDirectoryId = null;
 	};
@@ -865,6 +924,27 @@
 		}
 	};
 
+	// Keyed on the document, not its published file: moveFileToDirectoryHandler
+	// cannot address a document whose only version is still awaiting review, which
+	// is precisely the one an Эксперт has just uploaded and wants to file.
+	const moveDocumentToDirectoryHandler = async (documentId: string, directoryId: string | null) => {
+		const res = await moveDocumentInKnowledge(
+			localStorage.token,
+			knowledge.id,
+			documentId,
+			directoryId
+		).catch((e) => {
+			toast.error(`${e}`);
+			return null;
+		});
+
+		if (res) {
+			toast.success($i18n.t('File moved.'));
+			getItemsPage();
+			documentRegistry?.refresh();
+		}
+	};
+
 	const moveDirectoryHandler = async (dirId: string, targetParentId: string | null) => {
 		if (dirId === targetParentId) return;
 		const res = await updateKnowledgeDirectory(localStorage.token, knowledge.id, dirId, {
@@ -877,6 +957,9 @@
 		if (res) {
 			toast.success($i18n.t('Directory moved.'));
 			getItemsPage();
+			documentRegistry?.refresh();
+			// The sidebar tree reads /dirs and cannot see this any other way.
+			knowledgeDirectoryRevision.update((n) => n + 1);
 		}
 	};
 
@@ -1127,6 +1210,13 @@
 		}
 
 		id = $page.params.id;
+		// The sidebar tree links to WELDING_KB_HREF?dir=<id>. Read it before the
+		// first load so the screen opens inside the folder instead of at root and
+		// then jumping — init() runs below and picks this up.
+		currentDirectoryId = $page.url.searchParams.get('dir') || null;
+		// Seed the store as well: the watcher above compares the two, so leaving it
+		// at its default would pull a deep link straight back to the root.
+		activeKnowledgeDirectoryId.set(currentDirectoryId);
 		const res = await getKnowledgeById(localStorage.token, id).catch((e) => {
 			toast.error(`${e}`);
 			return null;
@@ -1481,6 +1571,20 @@
 									}}
 								/>
 							</div>
+
+							<!-- Secondary to «Загрузить новый документ» on purpose: uploading is
+							     the everyday action, foldering is occasional. It creates the folder
+							     inside whichever one is open, so the button follows the breadcrumb. -->
+							<button
+								class="px-3 py-1.5 rounded-xl border border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-850 transition font-medium text-sm flex items-center gap-1.5 shrink-0"
+								type="button"
+								on:click={() => {
+									showNewDirectoryModal = true;
+								}}
+							>
+								<NewFolderAlt className="size-4" />
+								{$i18n.t('Create folder')}
+							</button>
 						{/if}
 					</div>
 				</div>
@@ -1541,7 +1645,7 @@
 					</div>
 				</div>
 
-				{#if currentDirectoryId !== null}
+				{#if currentDirectoryId !== null && breadcrumbs.length > 0}
 					<div class="px-5 mt-2">
 						<KnowledgeBreadcrumbs
 							rootLabel={knowledge.name}
@@ -1579,8 +1683,19 @@
 												knowledgeId={knowledge.id}
 												canReview={canReviewVersions}
 												canUpload={knowledge?.write_access ?? false}
+												writeAccess={knowledge?.write_access ?? false}
+												directoryId={currentDirectoryId}
 												{query}
 												uploading={uploadingItems}
+												onNavigate={(dirId) => navigateToDirectory(dirId)}
+												onRenameDirectory={(dirId, name) => renameDirectoryHandler(dirId, name)}
+												onDeleteDirectory={(dirId) => confirmDeleteDirectory(dirId)}
+												onMoveDirectory={(dirId, targetId) => moveDirectoryHandler(dirId, targetId)}
+												onMoveDocument={(documentId, targetId) =>
+													moveDocumentToDirectoryHandler(documentId, targetId)}
+												onTree={(crumbs) => {
+													breadcrumbs = crumbs;
+												}}
 											/>
 										</div>
 									{:else}

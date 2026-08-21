@@ -2108,7 +2108,17 @@ DEFAULT_USER_PERMISSIONS = {
 
 USER_PERMISSIONS = DEFAULT_USER_PERMISSIONS
 
-ENABLE_FOLDERS = os.getenv('ENABLE_FOLDERS', 'True').lower() == 'true'
+# Fork default flipped to False. Upstream «Папки» are CHAT folders — a folder ties
+# a set of chats to a model, a prompt and a knowledge base. This deployment has one
+# knowledge base and one purpose, so that grouping earned nothing, and the word
+# «Папки» is wanted for the knowledge base's own directories instead (which are
+# knowledge_directory rows and unrelated to this flag).
+#
+# Nothing is deleted: Sidebar.svelte still renders the section behind this flag and
+# the folder table, routes and APIs are untouched, so setting ENABLE_FOLDERS=true
+# brings it all back. Migration f7a4c81be225 flips the already-stored row for
+# deployments that booted before this change.
+ENABLE_FOLDERS = os.getenv('ENABLE_FOLDERS', 'False').lower() == 'true'
 
 FOLDER_MAX_FILE_COUNT = os.getenv('FOLDER_MAX_FILE_COUNT', '')
 
