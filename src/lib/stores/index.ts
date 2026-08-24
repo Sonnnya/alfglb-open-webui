@@ -138,6 +138,19 @@ export const currentChatPage = writable(1);
 export const knowledgeDirectoryRevision = writable(0);
 
 /**
+ * Bumped whenever a DOCUMENT moves between folders. The mirror image of
+ * knowledgeDirectoryRevision above: that one tells the sidebar tree the folders
+ * changed, this one tells the knowledge base screen its document list did.
+ *
+ * It exists because the sidebar is now a drop target. A document dropped onto a
+ * folder in the tree is moved by the sidebar itself — it has the knowledge id and
+ * the API client — but the list it disappeared from is rendered by a component in
+ * a different tree, which would otherwise keep showing it until the next refetch.
+ * Same reasoning as the directory counter: they share the *fact*, not the data.
+ */
+export const knowledgeDocumentRevision = writable(0);
+
+/**
  * Which knowledge base folder is open, shared between the sidebar tree and the
  * knowledge base screen.
  *

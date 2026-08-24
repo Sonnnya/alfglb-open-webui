@@ -2,11 +2,26 @@
 	// The welding knowledge base's directory tree, in the sidebar slot the upstream
 	// chat «Папки» used to occupy (those are off — see ENABLE_FOLDERS in config.py).
 	//
-	// Navigation only. Creating, renaming, deleting and moving folders all live on
-	// the knowledge base screen, which is the one place that can also show what is
-	// inside them; a second set of controls here would be two menus that have to
-	// agree about permissions and refreshes. Clicking a folder opens the screen
-	// scoped to it, via WELDING_KB_HREF?dir=<id>.
+	// Its root row IS the «База знаний» menu entry — same BookOpen icon, same row
+	// styling, same left edge as «Рабочее пространство» above it. Sidebar.svelte
+	// therefore skips the pinned 'knowledge' item when this renders: two rows with
+	// one label, one of which silently did nothing when you were already on the
+	// screen, was the confusing part. Clicking the root now always lands on the
+	// base's root folder, from anywhere.
+	//
+	// Navigation, plus one mutation: it accepts DROPS. Creating, renaming and
+	// deleting folders still live on the knowledge base screen, which is the one
+	// place that can also show what is inside them; a second set of menus here
+	// would be two surfaces that have to agree about permissions and refreshes.
+	//
+	// A drop is different from a menu. The tree is the only place showing the whole
+	// hierarchy at once, so it is the only place you can move something UP several
+	// levels in one gesture — the folder rows on the right can only ever take a
+	// document deeper. The drag can only start on the knowledge base screen (that
+	// is where the draggable rows are, and they are gated on write access), so this
+	// adds a target, not a new way in.
+	//
+	// Clicking a folder opens the screen scoped to it, via WELDING_KB_HREF?dir=<id>.
 
 	import { getContext, onMount } from 'svelte';
 	import type { Writable } from 'svelte/store';
@@ -15,11 +30,22 @@
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
 
-	import { WELDING_KB_HREF } from '$lib/constants';
-	import { getKnowledgeDirectories } from '$lib/apis/knowledge';
-	import { knowledgeDirectoryRevision, activeKnowledgeDirectoryId } from '$lib/stores';
+	import { toast } from 'svelte-sonner';
 
-	import Folder from '$lib/components/icons/Folder.svelte';
+	import { WELDING_KB_HREF } from '$lib/constants';
+	import {
+		getKnowledgeDirectories,
+		moveDocumentInKnowledge,
+		updateKnowledgeDirectory
+	} from '$lib/apis/knowledge';
+	import {
+		knowledgeDirectoryRevision,
+		knowledgeDocumentRevision,
+		activeKnowledgeDirectoryId
+	} from '$lib/stores';
+	import { isKnowledgeDrag, readDirectoryDrag, readDocumentDrag } from '$lib/utils/knowledge-dnd';
+
+	import BookOpen from '$lib/components/icons/BookOpen.svelte';
 	import ChevronRight from '$lib/components/icons/ChevronRight.svelte';
 	import KnowledgeFolderNode from './KnowledgeFolders/KnowledgeFolderNode.svelte';
 
@@ -110,55 +136,150 @@
 		expanded = { ...expanded, [directoryId]: !expanded[directoryId] };
 	};
 
+	// ── Drops ─────────────────────────────────────────────────────────────
+	//
+	// Performed here rather than handed to the knowledge base screen: the two are
+	// separate component trees with no props between them, and this one already
+	// holds the knowledge id and talks to the API for /dirs. The screen finds out
+	// through the revision counters, exactly as this component finds out about the
+	// folders it creates.
+	let rootDragOver = false;
+
+	const handleDrop = async (
+		payload: { documentId?: string; directoryId?: string },
+		targetDirectoryId: string | null
+	) => {
+		if (payload.documentId) {
+			const res = await moveDocumentInKnowledge(
+				localStorage.token,
+				knowledgeId,
+				payload.documentId,
+				targetDirectoryId
+			).catch((e) => {
+				toast.error(`${e}`);
+				return null;
+			});
+
+			if (res) {
+				toast.success($i18n.t('File moved.'));
+				// The screen on the right is what renders the document list; it has no
+				// other way to learn the row it is showing has moved.
+				knowledgeDocumentRevision.update((n) => n + 1);
+			}
+			return;
+		}
+
+		if (payload.directoryId) {
+			const res = await updateKnowledgeDirectory(
+				localStorage.token,
+				knowledgeId,
+				payload.directoryId,
+				{
+					parent_id: targetDirectoryId
+				}
+			).catch((e) => {
+				toast.error(`${e}`);
+				return null;
+			});
+
+			if (res) {
+				toast.success($i18n.t('Directory moved.'));
+				// Both counters: the tree here has to redraw, and the screen's own
+				// folder rows and breadcrumbs are just as stale.
+				knowledgeDirectoryRevision.update((n) => n + 1);
+				knowledgeDocumentRevision.update((n) => n + 1);
+			}
+		}
+	};
+
 	onMount(refresh);
 </script>
 
-{#if loaded && directories.length > 0}
-	<div class="px-2 mt-0.5">
-		<!-- The base itself is the root NODE of the tree, not a section header with a
-		     separate «All documents» entry underneath. That entry was the artefact of
-		     using Folder.svelte as the header: it expands and collapses but dispatches
-		     no click, so getting back to the root needed a row of its own. Explorer
-		     does not work that way — the root is one row, its chevron folds the tree,
-		     its label opens the root. So this is the same KnowledgeFolderNode markup
-		     as every other row, with a null id meaning "the base". -->
+<!-- Rendered unconditionally, not behind `loaded` or `directories.length > 0`:
+     this row is the knowledge base's only entry point in the sidebar now, so it
+     must be there on the first paint and on a base that has no folders yet. Only
+     the chevron and the children wait for the fetch. -->
+<div class="mt-0.5">
+	<div class="px-[0.4375rem] flex justify-center text-gray-800 dark:text-gray-200">
+		<!-- svelte-ignore a11y-no-static-element-interactions -->
 		<div
-			class="w-full flex items-center gap-1 rounded-lg transition {activeId === null &&
-			$page.url.pathname.startsWith(WELDING_KB_HREF)
-				? 'bg-gray-100 dark:bg-gray-900'
-				: 'hover:bg-gray-100 dark:hover:bg-gray-900'}"
+			class="grow flex items-center rounded-2xl transition {rootDragOver
+				? 'bg-gray-100 dark:bg-gray-800 ring-1 ring-gray-300 dark:ring-gray-600'
+				: activeId === null && onKnowledgeScreen
+					? 'bg-gray-100 dark:bg-gray-900'
+					: 'hover:bg-gray-100 dark:hover:bg-gray-900'}"
+			on:dragover={(e) => {
+				if (!isKnowledgeDrag(e.dataTransfer)) return;
+				e.preventDefault();
+				e.stopPropagation();
+				rootDragOver = true;
+			}}
+			on:dragleave={() => (rootDragOver = false)}
+			on:drop={(e) => {
+				e.preventDefault();
+				e.stopPropagation();
+				rootDragOver = false;
+
+				// null target = out of every folder, back to the base's root. The
+				// breadcrumb bar can do this too, but only while you are standing
+				// inside a folder; this row is always there.
+				const documentId = readDocumentDrag(e.dataTransfer);
+				if (documentId) {
+					handleDrop({ documentId }, null);
+					return;
+				}
+
+				const directoryId = readDirectoryDrag(e.dataTransfer);
+				if (directoryId) {
+					handleDrop({ directoryId }, null);
+				}
+			}}
 		>
 			<button
-				class="p-1 shrink-0 text-gray-400 dark:text-gray-600"
-				type="button"
-				aria-label={$i18n.t('Knowledge base')}
-				on:click|stopPropagation={() => (open = !open)}
-			>
-				<ChevronRight className="size-3 transition-transform {open ? 'rotate-90' : ''}" />
-			</button>
-
-			<button
-				class="flex-1 min-w-0 flex items-center gap-1.5 py-1 pr-2 text-left"
+				id="sidebar-knowledge-button"
+				class="grow flex items-center space-x-3 min-w-0 px-2.5 py-2 text-left"
 				type="button"
 				on:click={() => openDirectory(null)}
 			>
-				<Folder className="size-3.5 shrink-0 text-gray-500" />
-				<span class="truncate text-sm">{$i18n.t('Knowledge base')}</span>
+				<div class="self-center shrink-0">
+					<BookOpen className="size-4.5" strokeWidth="1.5" />
+				</div>
+				<div class="flex flex-1 min-w-0 self-center translate-y-[0.5px]">
+					<div class="self-center text-sm font-primary truncate">{$i18n.t('Knowledge Base')}</div>
+				</div>
 			</button>
-		</div>
 
-		{#if open}
+			<!-- On the RIGHT, unlike every other row of the tree: keeping it there is
+			     what lets the BookOpen icon sit on the same left edge as the menu
+			     entries above, so the row still reads as one of them. The children
+			     below carry the usual left-hand chevrons. -->
+			{#if (childrenOf[''] ?? []).length > 0}
+				<button
+					class="p-1 mr-1.5 shrink-0 text-gray-400 dark:text-gray-600"
+					type="button"
+					aria-label={$i18n.t('Knowledge Base')}
+					on:click|stopPropagation={() => (open = !open)}
+				>
+					<ChevronRight className="size-3 transition-transform {open ? 'rotate-90' : ''}" />
+				</button>
+			{/if}
+		</div>
+	</div>
+
+	{#if open}
+		<div class="px-2">
 			{#each childrenOf[''] ?? [] as directory (directory.id)}
 				<KnowledgeFolderNode
 					{directory}
 					{childrenOf}
 					{expanded}
 					{activeId}
-					depth={1}
+					depth={0}
 					onOpen={openDirectory}
 					onToggle={toggle}
+					onDrop={handleDrop}
 				/>
 			{/each}
-		{/if}
-	</div>
-{/if}
+		</div>
+	{/if}
+</div>

@@ -20,6 +20,7 @@
 		user,
 		settings,
 		knowledgeDirectoryRevision,
+		knowledgeDocumentRevision,
 		activeKnowledgeDirectoryId
 	} from '$lib/stores';
 
@@ -143,6 +144,12 @@
 	let documentRegistry: { refresh: () => void } | null = null;
 	let fileItems = null;
 	let fileItemsTotal = null;
+	// Reported by DocumentRegistry, which is the only caller of /documents and so
+	// the only thing that knows the base-wide figure. Kept apart from
+	// fileItemsTotal, which still gates the registry block below and still means
+	// "published files at this level" — repurposing it would have hidden the whole
+	// screen whenever the two disagreed.
+	let documentsTotal: number | null = null;
 
 	// Files still uploading, handed to the registry so it can show a row with a
 	// spinner. Two sources already feed fileItems with status 'uploading': the
@@ -842,6 +849,16 @@
 		writeDirectoryToUrl($activeKnowledgeDirectoryId);
 	}
 
+	// A document moved. The single refresh path for it, wherever the move came
+	// from: this screen's own ⋮ menu and drag-and-drop, or a drop onto the sidebar
+	// tree, which is a different component tree entirely and can only signal.
+	let appliedDocumentRevision = 0;
+	$: if (knowledge && $knowledgeDocumentRevision !== appliedDocumentRevision) {
+		appliedDocumentRevision = $knowledgeDocumentRevision;
+		getItemsPage();
+		documentRegistry?.refresh();
+	}
+
 	const createDirectoryHandler = async (name: string) => {
 		const res = await createKnowledgeDirectory(
 			localStorage.token,
@@ -940,8 +957,12 @@
 
 		if (res) {
 			toast.success($i18n.t('File moved.'));
-			getItemsPage();
-			documentRegistry?.refresh();
+			// Refreshing is left to the knowledgeDocumentRevision watcher rather than
+			// done here: a document dropped onto the sidebar tree is moved by the
+			// sidebar, so that path has to exist anyway, and having one path means the
+			// two cannot drift. Bumping it also keeps the server-computed folder
+			// counts honest.
+			knowledgeDocumentRevision.update((n) => n + 1);
 		}
 	};
 
@@ -1363,11 +1384,19 @@
 							/>
 
 							<div class="shrink-0 mr-2.5">
-								{#if fileItemsTotal}
+								<!-- The WHOLE base, subfolders and pending revisions included.
+								     It used to be fileItemsTotal, i.e. the /files search — which
+								     is published-only and scoped to the open folder, so standing
+								     in a folder showed that folder's approved files and read as
+								     the base having shrunk. `!== null` rather than a truthiness
+								     test so an empty base says «0», not nothing. -->
+								{#if documentsTotal !== null}
 									<div class="text-xs text-gray-500">
-										<!-- {$i18n.t('{{COUNT}} files')} -->
-										{$i18n.t('{{COUNT}} files', {
-											COUNT: fileItemsTotal
+										<!-- Lowercase `count`, not the upstream {{COUNT}}: i18next selects a
+										     plural form from the `count` option specifically, so the
+										     uppercase one rendered «1 файлов». -->
+										{$i18n.t('{{count}} files', {
+											count: documentsTotal
 										})}
 									</div>
 								{/if}
@@ -1651,7 +1680,7 @@
 							rootLabel={knowledge.name}
 							{breadcrumbs}
 							onNavigate={(dirId) => navigateToDirectory(dirId)}
-							onMoveFile={(fileId, dirId) => moveFileToDirectoryHandler(fileId, dirId)}
+							onMoveFile={(documentId, dirId) => moveDocumentToDirectoryHandler(documentId, dirId)}
 							onMoveDir={(dirId, targetId) => moveDirectoryHandler(dirId, targetId)}
 						/>
 					</div>
@@ -1695,6 +1724,9 @@
 													moveDocumentToDirectoryHandler(documentId, targetId)}
 												onTree={(crumbs) => {
 													breadcrumbs = crumbs;
+												}}
+												onTotal={(totalAll) => {
+													documentsTotal = totalAll;
 												}}
 											/>
 										</div>

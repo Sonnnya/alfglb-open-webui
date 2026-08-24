@@ -3,11 +3,18 @@
 	const i18n = getContext('i18n');
 
 	import ChevronRight from '$lib/components/icons/ChevronRight.svelte';
+	import { isKnowledgeDrag, readDirectoryDrag, readDocumentDrag } from '$lib/utils/knowledge-dnd';
 
 	export let rootLabel: string = 'Root';
 	export let breadcrumbs: { id: string; name: string }[] = [];
 	export let onNavigate: (directoryId: string | null) => void = () => {};
-	export let onMoveFile: (fileId: string, targetDirectoryId: string | null) => void = () => {};
+	/**
+	 * A DOCUMENT id, despite the name and the payload key — see knowledge-dnd.ts.
+	 * The parent must therefore route this to the document-keyed move, not the
+	 * file-keyed one: wiring it to the latter is what made dropping onto a
+	 * breadcrumb silently fail, since a document id is not a file id.
+	 */
+	export let onMoveFile: (documentId: string, targetDirectoryId: string | null) => void = () => {};
 	export let onMoveDir: (dirId: string, targetDirectoryId: string | null) => void = () => {};
 
 	let breadcrumbEl: HTMLDivElement;
@@ -18,9 +25,7 @@
 	});
 
 	const handleDragOver = (e: DragEvent, index: number) => {
-		const hasFile = e.dataTransfer?.types.includes('application/x-kb-file-move');
-		const hasDir = e.dataTransfer?.types.includes('application/x-kb-dir-move');
-		if (!hasFile && !hasDir) return;
+		if (!isKnowledgeDrag(e.dataTransfer)) return;
 		e.preventDefault();
 		e.stopPropagation();
 		dragOverCrumb = index;
@@ -34,20 +39,19 @@
 		e.preventDefault();
 		e.stopPropagation();
 		dragOverCrumb = null;
-		const fileRaw = e.dataTransfer?.getData('application/x-kb-file-move');
-		if (fileRaw) {
-			try {
-				const data = JSON.parse(fileRaw);
-				if (data.fileId) onMoveFile(data.fileId, targetDirId);
-			} catch {}
+
+		const documentId = readDocumentDrag(e.dataTransfer);
+		if (documentId) {
+			onMoveFile(documentId, targetDirId);
 			return;
 		}
-		const dirRaw = e.dataTransfer?.getData('application/x-kb-dir-move');
-		if (dirRaw) {
-			try {
-				const data = JSON.parse(dirRaw);
-				if (data.dirId) onMoveDir(data.dirId, targetDirId);
-			} catch {}
+
+		const dirId = readDirectoryDrag(e.dataTransfer);
+		// A crumb IS an ancestor of the folder being dragged, so this is the only
+		// way to move a folder UP the tree — the folder rows below can only ever
+		// take it deeper.
+		if (dirId && dirId !== targetDirId) {
+			onMoveDir(dirId, targetDirId);
 		}
 	};
 </script>

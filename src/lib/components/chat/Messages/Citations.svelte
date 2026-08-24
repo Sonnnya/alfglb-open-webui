@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { getContext } from 'svelte';
-	import { embed, showControls, showEmbeds } from '$lib/stores';
+	import { embed, showControls, showEmbeds, user } from '$lib/stores';
 
 	import CitationModal from './Citations/CitationModal.svelte';
 
@@ -18,12 +18,45 @@
 
 	let citationModal = null;
 
+	// ── Who may open a source ─────────────────────────────────────────────
+	//
+	// The listing stays for everyone — knowing WHICH documents an answer came from
+	// is the point of citations. Opening one is different: CitationModal renders
+	// the retrieved chunk text in full and links to /files/{id}/content, so it is a
+	// way to read and download a document without ever visiting the knowledge base.
+	// That is exactly what the fork's `retrieve` grant is meant to withhold (see
+	// models/access_grants.py) — a model may answer FROM a document for you; you
+	// may not open it yourself.
+	//
+	// Deliberately role === 'admin' alone, NOT the workspace.knowledge test used
+	// elsewhere: Эксперт and Мастер-эксперт lose the preview here too. They can
+	// read the same documents on the knowledge base screen, which is the place that
+	// shows provenance, versions and review state rather than a bare chunk.
+	//
+	// This gates BOTH ways in: the list below, and showSourceModal() — which is what
+	// the inline citation chips in the answer call, through
+	// ResponseMessage.svelte -> citationsElement.showSourceModal(). One chokepoint,
+	// so nothing new that reaches for a source can bypass it.
+	//
+	// NOTE: this is a UI curtain, not enforcement. The chunk text arrives with the
+	// message as sources[].document[] and is persisted in chat history, so it is
+	// still readable via devtools or GET /api/v1/chats/{id}. Stripping it server
+	// side in process_chat_response is the enforcing version.
+	$: canOpenSources = $user?.role === 'admin';
+
 	let showCitations = false;
 	let showCitationModal = false;
 
 	let selectedCitation: any = null;
 
 	export const showSourceModal = (sourceId) => {
+		// The inline chips render non-interactively for non-admins, so this should
+		// not be reachable — kept because it is the entry point ResponseMessage
+		// calls, and a component added later would otherwise route around the gate.
+		if (!canOpenSources) {
+			return;
+		}
+
 		let index;
 		let suffix = null;
 
@@ -210,26 +243,45 @@
 	<div class="py-1.5">
 		<div class="text-xs gap-2 flex flex-col">
 			{#each citations as citation, idx}
-				<button
-					id={`source-${id}-${idx + 1}`}
-					aria-label={$i18n.t('View source: {{name}}', {
-						name: decodeString(citation.source.name)
-					})}
-					class="no-toggle outline-hidden flex dark:text-gray-300 bg-transparent text-gray-600 rounded-xl gap-1.5 items-center"
-					on:click={() => {
-						showCitationModal = true;
-						selectedCitation = citation;
-					}}
-				>
-					<div class=" font-medium bg-gray-50 dark:bg-gray-850 rounded-md px-1">
-						{idx + 1}
-					</div>
-					<div
-						class="flex-1 truncate hover:text-black dark:text-white/60 dark:hover:text-white transition text-left"
+				{#if canOpenSources}
+					<button
+						id={`source-${id}-${idx + 1}`}
+						aria-label={$i18n.t('View source: {{name}}', {
+							name: decodeString(citation.source.name)
+						})}
+						class="no-toggle outline-hidden flex dark:text-gray-300 bg-transparent text-gray-600 rounded-xl gap-1.5 items-center"
+						on:click={() => {
+							showCitationModal = true;
+							selectedCitation = citation;
+						}}
 					>
-						{decodeString(citation.source.name)}
+						<div class=" font-medium bg-gray-50 dark:bg-gray-850 rounded-md px-1">
+							{idx + 1}
+						</div>
+						<div
+							class="flex-1 truncate hover:text-black dark:text-white/60 dark:hover:text-white transition text-left"
+						>
+							{decodeString(citation.source.name)}
+						</div>
+					</button>
+				{:else}
+					<!-- Same row, rendered inert: a real <div> rather than a disabled button,
+					     so there is no pointer cursor, no hover-to-black, and no "View
+					     source" announced to a screen reader for something that will not
+					     open. The number and the name — which is all the listing is for —
+					     are unchanged. -->
+					<div
+						id={`source-${id}-${idx + 1}`}
+						class="flex dark:text-gray-300 text-gray-600 gap-1.5 items-center"
+					>
+						<div class=" font-medium bg-gray-50 dark:bg-gray-850 rounded-md px-1">
+							{idx + 1}
+						</div>
+						<div class="flex-1 truncate dark:text-white/60 text-left">
+							{decodeString(citation.source.name)}
+						</div>
 					</div>
-				</button>
+				{/if}
 			{/each}
 		</div>
 	</div>

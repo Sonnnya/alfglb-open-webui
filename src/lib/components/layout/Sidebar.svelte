@@ -126,6 +126,14 @@
 
 	$: isMenuItemVisible = (id) => isMenuItemVisibleFor(id, $config, $user);
 
+	// Whether the knowledge base's own tree is drawn in the sidebar. Its root row
+	// IS the «База знаний» menu entry, so the pinned item is skipped wherever this
+	// is true — one expression, referenced twice, because the two drifting apart
+	// would either duplicate the row or lose it entirely. Deliberately the same
+	// test as isMenuItemVisible('knowledge') in utils/menu-items.ts.
+	$: showKnowledgeTree =
+		$user?.role === 'admin' || ($user?.permissions?.workspace?.knowledge ?? false);
+
 	const initPinnedMenuSortable = () => {
 		const el = document.getElementById('pinned-menu-items-list');
 		if (el && !$mobile) {
@@ -1117,7 +1125,12 @@
 					<div id="pinned-menu-items-list">
 						{#each pinnedItems as itemId (itemId)}
 							{@const meta = getMenuItemMeta(itemId)}
-							{#if meta && isMenuItemVisible(itemId)}
+							<!-- 'knowledge' is drawn by KnowledgeFolders below instead, as the
+							     root of its own tree — see the comment there. Skipped only when
+							     that component actually renders; otherwise a viewer who may open
+							     the base would lose the entry altogether. The collapsed rail
+							     above still draws it: an icon rail has no room for a tree. -->
+							{#if meta && isMenuItemVisible(itemId) && !(itemId === 'knowledge' && showKnowledgeTree)}
 								<div
 									class="px-[0.4375rem] flex justify-center text-gray-800 dark:text-gray-200"
 									data-id={itemId}
@@ -1191,6 +1204,17 @@
 							{/if}
 						{/each}
 					</div>
+
+					<!-- The knowledge base and its directory tree, directly under the menu
+					     entries and ABOVE «Модели» / «Заметки» / «Каналы»: its root row is
+					     the «База знаний» entry itself (KnowledgeFolders draws it), so the
+					     pinned item above is skipped and nothing may come between the two.
+					     Same audience expression as isMenuItemVisible('knowledge') in
+					     utils/menu-items.ts — if the two ever disagree the tree becomes a
+					     list of folder names for a base the viewer cannot open. -->
+					{#if showKnowledgeTree}
+						<KnowledgeFolders knowledgeId={WELDING_KB_ID} />
+					{/if}
 				</div>
 
 				{#if ($models ?? []).length > 0 && (($settings?.pinnedModels ?? []).length > 0 || $config?.default_pinned_models)}
@@ -1259,16 +1283,6 @@
 							{/if}
 						{/each}
 					</Folder>
-				{/if}
-
-				<!-- The welding knowledge base's own directory tree, in the slot the chat
-				     «Папки» below used to occupy (they are off — ENABLE_FOLDERS defaults to
-				     False in config.py). Same audience as the «База знаний» menu entry, and
-				     deliberately the same expression as isMenuItemVisible('knowledge') in
-				     utils/menu-items.ts — if the two ever disagree the tree becomes a list of
-				     folder names for a base the viewer cannot open. -->
-				{#if $user?.role === 'admin' || $user?.permissions?.workspace?.knowledge}
-					<KnowledgeFolders knowledgeId={WELDING_KB_ID} />
 				{/if}
 
 				{#if $config?.features?.enable_folders && ($user?.role === 'admin' || ($user?.permissions?.features?.folders ?? true))}
