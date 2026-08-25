@@ -15,6 +15,13 @@
 
 	export let note = '';
 	export let submitting = false;
+	/**
+	 * Which outcome the reviewer reached for. Both buttons are always rendered —
+	 * this only decides which one is solid and which is outlined, so opening the
+	 * form from «Отклонить версию» does not present «Одобрить» as the obvious
+	 * thing to click. Defaults to 'approve', which is what the status badge means.
+	 */
+	export let intent: 'approve' | 'reject' = 'approve';
 	export let onApprove: () => void = () => {};
 	export let onReject: () => void = () => {};
 	export let onCancel: () => void = () => {};
@@ -26,16 +33,22 @@
 		bind:value={note}
 		placeholder={$i18n.t('Reason (optional)')}
 	/>
+	<!-- Order is fixed regardless of intent: buttons that swap places between
+	     openings are how people click the wrong one. Only the emphasis moves. -->
 	<div class="flex gap-2">
 		<button
 			type="button"
-			class="px-2.5 py-1 rounded-lg text-xs font-medium bg-green-600 hover:bg-green-700 text-white disabled:opacity-50"
+			class="px-2.5 py-1 rounded-lg text-xs font-medium disabled:opacity-50 {intent === 'approve'
+				? 'bg-green-600 hover:bg-green-700 text-white'
+				: 'border border-green-600 text-green-700 dark:text-green-500 hover:bg-green-600/10'}"
 			disabled={submitting}
 			on:click={onApprove}>{$i18n.t('Approve')}</button
 		>
 		<button
 			type="button"
-			class="px-2.5 py-1 rounded-lg text-xs font-medium bg-red-600 hover:bg-red-700 text-white disabled:opacity-50"
+			class="px-2.5 py-1 rounded-lg text-xs font-medium disabled:opacity-50 {intent === 'reject'
+				? 'bg-red-600 hover:bg-red-700 text-white'
+				: 'border border-red-600 text-red-700 dark:text-red-500 hover:bg-red-600/10'}"
 			disabled={submitting}
 			on:click={onReject}>{$i18n.t('Reject')}</button
 		>

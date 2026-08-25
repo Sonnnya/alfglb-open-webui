@@ -248,6 +248,13 @@ class KnowledgeDirectoryModel(BaseModel):
     created_at: int  # timestamp in epoch
     updated_at: int  # timestamp in epoch
 
+    # Documents in this folder AND every folder under it. None where nothing has
+    # computed it — the routes that return a bare directory row (/dirs, create,
+    # rename) do not, because they answer "what folders exist", not "how full are
+    # they". Only search_documents_by_id fills it in, after model_validate: the
+    # column does not exist on KnowledgeDirectory, so from_attributes cannot.
+    file_count: Optional[int] = None
+
 
 class KnowledgeDirectoryForm(BaseModel):
     name: str
@@ -342,6 +349,12 @@ class KnowledgeDocumentListResponse(BaseModel):
 
     items: list[KnowledgeDocumentResponse]
     total: int
+    # Documents in the WHOLE knowledge base — every folder, every status —
+    # regardless of the query, the folder or the page. Deliberately not `total`,
+    # which is the count this listing pages through and therefore drops to the
+    # current level in folder mode and to the hit count during a search. The
+    # header count needs the invariant one; the pager needs the scoped one.
+    total_all: int = 0
     directories: list[KnowledgeDirectoryModel] = Field(default_factory=list)
     breadcrumbs: list[KnowledgeDirectoryModel] = Field(default_factory=list)
 
@@ -1043,15 +1056,36 @@ class KnowledgeTable:
             )
 
             in_folder_mode = 'directory_id' in filter
+
+            # One GROUP BY for the whole base, on every page. `total` above is what
+            # this listing pages through, so it means "this folder" in folder mode
+            # and "hits" during a search — neither of which is the number the header
+            # wants. Summing the direct counts gives the base-wide one.
+            direct_counts = await self.get_document_counts_by_directory(knowledge_id, db=db)
+            total_all = sum(direct_counts.values())
+
+            directories = (
+                await self.get_directories(knowledge_id, parent_id=directory_id, db=db)
+                if in_folder_mode and not skip
+                else []
+            )
+            if directories:
+                # The folder tree, once, only when there are folder rows to label.
+                # A folder's count must include its subfolders: an Эксперт standing
+                # at the root of «ГОСТы» reads 0 next to it while forty documents sit
+                # one level down, which is what made the old number confusing.
+                subtree_counts = self.rollup_subtree_counts(
+                    await self.get_all_directories(knowledge_id, db=db), direct_counts
+                )
+                for directory in directories:
+                    directory.file_count = subtree_counts.get(directory.id, 0)
+
             return KnowledgeDocumentListResponse(
                 # Folders ride along on the FIRST page only. They are not paginated —
                 # `total` counts documents — so returning them again on page 2 would
                 # redraw every subfolder above the second page of documents.
-                directories=(
-                    await self.get_directories(knowledge_id, parent_id=directory_id, db=db)
-                    if in_folder_mode and not skip
-                    else []
-                ),
+                directories=directories,
+                total_all=total_all,
                 # Breadcrumbs, by contrast, belong on every page: the path is where
                 # you are, not what is in front of you.
                 breadcrumbs=(await self.get_directory_breadcrumbs(directory_id, db=db) if in_folder_mode else []),
@@ -1638,6 +1672,74 @@ class KnowledgeTable:
             stmt = stmt.order_by(KnowledgeDirectory.name.asc())
             result = await db.execute(stmt)
             return [KnowledgeDirectoryModel.model_validate(d) for d in result.scalars().all()]
+
+    async def get_document_counts_by_directory(
+        self, knowledge_id: str, db: Optional[AsyncSession] = None
+    ) -> dict[Optional[str], int]:
+        """How many documents sit *directly* in each folder. ``None`` is the root.
+
+        Counts exactly the rows ``search_documents_by_id`` would list — same three
+        joins, same ``file is not None`` rule — so the number on a folder can never
+        disagree with the number of rows you get after clicking it. A plain
+        ``COUNT(*)`` over knowledge_file would also count documents whose file row
+        has gone, which the registry skips and nobody can open.
+        """
+        async with get_async_db_context(db) as db:
+            latest = (
+                select(
+                    KnowledgeFileVersion.knowledge_file_id.label('kf_id'),
+                    func.max(KnowledgeFileVersion.version_no).label('max_no'),
+                )
+                .group_by(KnowledgeFileVersion.knowledge_file_id)
+                .subquery()
+            )
+            version = aliased(KnowledgeFileVersion)
+
+            stmt = (
+                select(KnowledgeFile.directory_id, func.count())
+                .outerjoin(latest, latest.c.kf_id == KnowledgeFile.id)
+                .outerjoin(
+                    version,
+                    and_(
+                        version.knowledge_file_id == KnowledgeFile.id,
+                        version.version_no == latest.c.max_no,
+                    ),
+                )
+                .outerjoin(File, File.id == func.coalesce(version.file_id, KnowledgeFile.file_id))
+                .filter(KnowledgeFile.knowledge_id == knowledge_id)
+                .filter(File.id.isnot(None))
+                .group_by(KnowledgeFile.directory_id)
+            )
+
+            return {directory_id: count for directory_id, count in (await db.execute(stmt)).all()}
+
+    @staticmethod
+    def rollup_subtree_counts(
+        directories: list[KnowledgeDirectoryModel], direct: dict[Optional[str], int]
+    ) -> dict[str, int]:
+        """Turn per-folder counts into per-*subtree* counts.
+
+        Done in Python over the folder list rather than as a recursive CTE: a base
+        holds tens of folders, both dialects then behave identically, and the
+        SQLite dev database needs no special casing. Each folder walks up its own
+        parent chain adding its direct count to every ancestor, with a ``seen``
+        guard because nothing in the schema forbids a cycle.
+        """
+        parent_of = {d.id: d.parent_id for d in directories}
+        subtree = {d.id: direct.get(d.id, 0) for d in directories}
+
+        for directory in directories:
+            own = direct.get(directory.id, 0)
+            if not own:
+                continue
+            current = parent_of.get(directory.id)
+            seen = {directory.id}
+            while current and current in subtree and current not in seen:
+                seen.add(current)
+                subtree[current] += own
+                current = parent_of.get(current)
+
+        return subtree
 
     async def get_all_directories(
         self,

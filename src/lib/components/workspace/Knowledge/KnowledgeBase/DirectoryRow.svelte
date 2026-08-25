@@ -7,7 +7,12 @@
 	dayjs.extend(relativeTime);
 
 	import { getContext } from 'svelte';
-	const i18n = getContext('i18n');
+	import type { Writable } from 'svelte/store';
+	import type { i18n as i18nType } from 'i18next';
+
+	// Typed, like DocumentRegistry: the bare getContext('i18n') makes svelte-check
+	// reject every $i18n.t() in the file with "Cannot use 'i18n' as a store".
+	const i18n = getContext<Writable<i18nType>>('i18n');
 
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Dropdown from '$lib/components/common/Dropdown.svelte';
@@ -15,12 +20,20 @@
 	import Pencil from '$lib/components/icons/Pencil.svelte';
 	import Folder from '$lib/components/icons/Folder.svelte';
 	import EllipsisHorizontal from '$lib/components/icons/EllipsisHorizontal.svelte';
+	import {
+		isKnowledgeDrag,
+		readDirectoryDrag,
+		readDocumentDrag,
+		setDirectoryDrag
+	} from '$lib/utils/knowledge-dnd';
 
 	export let directory: {
 		id: string;
 		name: string;
 		created_at: number;
 		updated_at: number;
+		/** Documents in this folder AND everything under it. */
+		file_count?: number | null;
 	};
 	export let writeAccess = false;
 
@@ -64,15 +77,13 @@
 		: 'hover:bg-gray-100 dark:hover:bg-gray-850'}"
 	draggable="true"
 	on:dragstart={(e) => {
-		e.dataTransfer?.setData('application/x-kb-dir-move', JSON.stringify({ dirId: directory.id }));
+		setDirectoryDrag(e.dataTransfer, directory.id);
 	}}
 	on:dblclick={() => {
 		if (writeAccess) startRename();
 	}}
 	on:dragover={(e) => {
-		const hasFile = e.dataTransfer?.types.includes('application/x-kb-file-move');
-		const hasDir = e.dataTransfer?.types.includes('application/x-kb-dir-move');
-		if (!hasFile && !hasDir) return;
+		if (!isKnowledgeDrag(e.dataTransfer)) return;
 		e.preventDefault();
 		e.stopPropagation();
 		dragOver = true;
@@ -84,22 +95,18 @@
 		e.preventDefault();
 		e.stopPropagation();
 		dragOver = false;
-		const fileRaw = e.dataTransfer?.getData('application/x-kb-file-move');
-		if (fileRaw) {
-			try {
-				const data = JSON.parse(fileRaw);
-				onFileDrop(data.fileId, directory.id);
-			} catch {}
+
+		const documentId = readDocumentDrag(e.dataTransfer);
+		if (documentId) {
+			onFileDrop(documentId, directory.id);
 			return;
 		}
-		const dirRaw = e.dataTransfer?.getData('application/x-kb-dir-move');
-		if (dirRaw) {
-			try {
-				const data = JSON.parse(dirRaw);
-				if (data.dirId !== directory.id) {
-					onDirDrop(data.dirId, directory.id);
-				}
-			} catch {}
+
+		const dirId = readDirectoryDrag(e.dataTransfer);
+		// Dropping a folder on itself is a no-op, not a cycle — the backend also
+		// refuses, but silently doing nothing reads better than a toast.
+		if (dirId && dirId !== directory.id) {
+			onDirDrop(dirId, directory.id);
 		}
 	}}
 >
@@ -150,6 +157,16 @@
 		</div>
 
 		<div class="flex items-center gap-2 shrink-0">
+			<!-- The whole subtree, not this level: a folder that only contains
+			     folders would otherwise read «0» while holding the entire corpus.
+			     Rendered for 0 as well — an empty folder saying so is information,
+			     and a number that appears and disappears makes the column jump. -->
+			{#if directory.file_count !== null && directory.file_count !== undefined}
+				<div class="text-xs text-gray-400">
+					{$i18n.t('{{count}} files', { count: directory.file_count })}
+				</div>
+			{/if}
+
 			{#if directory.updated_at}
 				<Tooltip content={dayjs(directory.updated_at * 1000).format('LLLL')}>
 					<div class="text-xs text-gray-400">

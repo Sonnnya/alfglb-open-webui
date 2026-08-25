@@ -39,6 +39,9 @@
 	import TagEditor from './TagEditor.svelte';
 	import DocumentPage from '$lib/components/icons/DocumentPage.svelte';
 	import DirectoryRow from './DirectoryRow.svelte';
+	import DocumentMenu from './DocumentMenu.svelte';
+	import MoveDocumentModal from './MoveDocumentModal.svelte';
+	import { setDocumentDrag } from '$lib/utils/knowledge-dnd';
 
 	// Typed rather than the bare getContext('i18n') used elsewhere: untyped, every
 	// $i18n.t() call raises "Cannot use 'i18n' as a store" under svelte-check.
@@ -97,6 +100,15 @@
 	 * different trigger and would drift on a search, where scoping is dropped.
 	 */
 	export let onTree: (breadcrumbs: any[]) => void = () => {};
+	/**
+	 * How many documents the whole base holds — every folder, every status.
+	 *
+	 * Reported from here for the same reason the breadcrumbs are: /documents is
+	 * what knows it. Deliberately NOT `total`, which is what this listing pages
+	 * through and so shrinks to the open folder or to the search hits. The header
+	 * count above the list wants the invariant number.
+	 */
+	export let onTotal: (totalAll: number) => void = () => {};
 
 	// Must match DOCUMENT_REGISTRY_PAGE_COUNT in backend/open_webui/routers/knowledge.py —
 	// the server decides how many rows come back, this only decides whether to draw
@@ -143,6 +155,7 @@
 			// «База знаний / ГОСТы» above results gathered from the whole base
 			// would be a straightforward lie about what is on screen.
 			onTree(res.breadcrumbs ?? []);
+			onTotal(res.total_all ?? 0);
 		}
 		loading = false;
 	};
@@ -270,6 +283,23 @@
 		}
 	};
 
+	// ── Move ──────────────────────────────────────────────────────────────
+	//
+	// The same onMoveDocument the drag-and-drop path calls — the dialog only picks
+	// the destination differently. Kept whole here rather than in the parent so the
+	// row that opened it is the row that gets moved.
+	let movingDocument: { id: string; name: string; directoryId: string | null } | null = null;
+	let showMoveModal = false;
+
+	const openMove = (doc: any) => {
+		movingDocument = {
+			id: doc.document_id,
+			name: doc.filename,
+			directoryId: doc.directory_id ?? null
+		};
+		showMoveModal = true;
+	};
+
 	// ── Delete ────────────────────────────────────────────────────────────
 	//
 	// Deleting takes the document's whole version history with it, so the right
@@ -366,9 +396,17 @@
 	let reviewingId: string | null = null;
 	let reviewNote = '';
 	let submitting = false;
+	// Which outcome the reviewer reached for, so the form can emphasise it. Not a
+	// decision — the form still offers both, and nothing is submitted until one of
+	// its buttons is pressed.
+	let reviewIntent: 'approve' | 'reject' = 'approve';
 
-	const openReview = (versionId: string) => {
-		reviewingId = reviewingId === versionId ? null : versionId;
+	const openReview = (versionId: string, intent: 'approve' | 'reject' = 'approve') => {
+		// Re-opening with the OTHER intent should switch the emphasis rather than
+		// close the form: picking «Отклонить версию» while the approve form is open
+		// is a change of mind, not a request to dismiss it.
+		reviewingId = reviewingId === versionId && reviewIntent === intent ? null : versionId;
+		reviewIntent = intent;
 		reviewNote = '';
 	};
 
@@ -434,6 +472,24 @@
 	const statusType = (status: string) =>
 		status === 'approved' ? 'success' : status === 'rejected' ? 'error' : 'warning';
 
+	// «Скачать» in the ⋮ menu. The per-version route rather than /files/{id}/content
+	// for two reasons: it sends Content-Disposition: attachment, which is what the
+	// item promises, and it authorises on the KNOWLEDGE BASE — a revision still
+	// awaiting review has no knowledge_file row, so has_access_to_file cannot
+	// resolve it and the file route 404s for everyone but the uploader (see the
+	// docstring on download_version in routers/knowledge.py).
+	//
+	// The filename link above deliberately does NOT use this: it opens the document
+	// in a tab, and an attachment response would flash a tab open and hand back a
+	// download instead. Legacy documents predate versioning and have no version
+	// row, so they fall back to the file route.
+	const downloadHref = (doc: any) =>
+		doc.version_id
+			? `${WEBUI_API_BASE_URL}/knowledge/${knowledgeId}/version/${doc.version_id}/download`
+			: doc.file_id
+				? `${WEBUI_API_BASE_URL}/files/${doc.file_id}/content`
+				: null;
+
 	$: if (page) load();
 
 	onMount(load);
@@ -460,6 +516,16 @@
 	on:confirm={confirmVersionDelete}
 	on:cancel={() => (confirmVersion = null)}
 />
+
+{#if movingDocument}
+	<MoveDocumentModal
+		bind:show={showMoveModal}
+		{knowledgeId}
+		documentName={movingDocument.name}
+		currentDirectoryId={movingDocument.directoryId}
+		onMove={(targetId) => onMoveDocument(movingDocument?.id ?? '', targetId)}
+	/>
+{/if}
 
 <input
 	bind:this={versionInput}
@@ -519,25 +585,47 @@
 					draggable={writeAccess}
 					on:dragstart={(e) => {
 						if (!writeAccess) return;
-						// Same mime DirectoryRow and KnowledgeBreadcrumbs already listen for,
-						// but the payload carries the DOCUMENT id: a document awaiting review
-						// has no published file to move by. Both consumers just forward it.
-						e.dataTransfer?.setData(
-							'application/x-kb-file-move',
-							JSON.stringify({ fileId: doc.document_id })
-						);
+						// A DOCUMENT id, not a file id — see knowledge-dnd.ts. Every drop
+						// target reads it through the same helper, so folder rows,
+						// breadcrumbs and the sidebar tree all accept this identically.
+						setDocumentDrag(e.dataTransfer, doc.document_id);
 					}}
 				>
-					<div class="flex items-center gap-2.5 w-full">
+					<!-- The header line toggles «История». Only this line, not the whole
+					     row: the expanded panel and the review form are siblings below it,
+					     and a click anywhere in them would otherwise fold the thing the
+					     user just opened.
+
+					     Guarded by closest() rather than stopPropagation on each control,
+					     so a control added later cannot silently start collapsing rows.
+					     The filename link, the status badge and the ⋮ menu all keep their
+					     own behaviour. Keyboard users reach the same thing through
+					     «История» in the ⋮ menu, which is why this needs no key handler. -->
+					<!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+					<div
+						class="flex items-center gap-2.5 w-full cursor-pointer rounded-xl hover:bg-gray-50 dark:hover:bg-gray-850/50 transition"
+						on:click={(e) => {
+							if ((e.target as HTMLElement)?.closest('a, button, input')) return;
+							toggleHistory(doc.document_id);
+						}}
+					>
 						<div class="text-gray-500 shrink-0">
 							<DocumentPage className="size-4" />
 						</div>
 
 						<div class="flex-1 min-w-0">
-							<!-- The filename downloads too — clicking a document's name is what
-							     people try first; the explicit «Скачать» link stays for discoverability. -->
+							<!-- OPENS the document in a tab — clicking a name is what people try
+							     first, and this is unchanged. Deliberately not downloadHref():
+							     that is the ⋮ menu's «Скачать», which responds with an
+							     attachment and would turn one click into a flashed-open tab plus
+							     a file on disk. -->
+							<!-- inline-block, not block: `block` stretched the anchor across the
+							     whole remaining width of the row, so clicking the empty space
+							     beside a short filename hit the link. That is invisible until the
+							     row itself became clickable — then most of the row silently
+							     refused to toggle the history. max-w-full keeps truncate working. -->
 							<a
-								class="block text-sm font-medium truncate hover:underline"
+								class="inline-block max-w-full text-sm font-medium truncate hover:underline"
 								href={`${WEBUI_API_BASE_URL}/files/${doc.file_id}/content`}
 								target="_blank"
 								rel="noopener noreferrer"
@@ -582,11 +670,15 @@
 
 							{#if canReview && doc.status === 'pending' && doc.version_id}
 								<!-- For a reviewer the status is the control: it opens the
-								     approve/reject form. For everyone else it is just a label. -->
+								     approve/reject form. For everyone else it is just a label.
+								     The ⋮ menu's «Одобрить версию» / «Отклонить версию» open the
+								     same form — the badge is not obviously clickable until you
+								     have tried it once. Its tooltip names neither outcome,
+								     because it offers both. -->
 								<button
 									type="button"
 									class="cursor-pointer"
-									title={$i18n.t('Approve')}
+									title={$i18n.t('Review version')}
 									on:click={() => openReview(doc.version_id)}
 								>
 									<Badge type={statusType(doc.status)} content={statusLabel(doc.status)} />
@@ -595,41 +687,28 @@
 								<Badge type={statusType(doc.status)} content={statusLabel(doc.status)} />
 							{/if}
 
-							<a
-								class="text-xs underline"
-								href={`${WEBUI_API_BASE_URL}/files/${doc.file_id}/content`}
-								target="_blank"
-								rel="noopener noreferrer">{$i18n.t('Download')}</a
-							>
-
-							{#if canUpload}
-								<button
-									type="button"
-									class="text-xs underline disabled:opacity-50"
-									disabled={uploadingId !== null}
-									on:click={() => pickNewVersion(doc.document_id)}
-								>
-									{uploadingId === doc.document_id
-										? $i18n.t('Uploading...')
-										: $i18n.t('Upload new version')}
-								</button>
+							<!-- The «Загрузить новую версию» button used to carry its own
+							     «Загружается...» label; inside a closed menu that feedback is
+							     invisible, so the row shows a spinner where the controls are. -->
+							{#if uploadingId === doc.document_id}
+								<Spinner className="size-3.5" />
 							{/if}
 
-							<button
-								type="button"
-								class="text-xs underline"
-								on:click={() => toggleHistory(doc.document_id)}>{$i18n.t('History')}</button
-							>
-
-							{#if mayDelete(doc)}
-								<button
-									type="button"
-									class="text-xs underline text-red-600 dark:text-red-500 disabled:opacity-50"
-									disabled={deleting}
-									on:click={() => (confirmDeleteId = doc.document_id)}
-									>{$i18n.t('Delete entire chain')}</button
-								>
-							{/if}
+							<DocumentMenu
+								downloadHref={downloadHref(doc)}
+								canReview={canReview && doc.status === 'pending' && !!doc.version_id}
+								{canUpload}
+								canDelete={mayDelete(doc)}
+								uploading={uploadingId !== null}
+								{deleting}
+								onApprove={() => openReview(doc.version_id, 'approve')}
+								onReject={() => openReview(doc.version_id, 'reject')}
+								canMove={writeAccess}
+								onUploadVersion={() => pickNewVersion(doc.document_id)}
+								onMove={() => openMove(doc)}
+								onHistory={() => toggleHistory(doc.document_id)}
+								onDelete={() => (confirmDeleteId = doc.document_id)}
+							/>
 						</div>
 					</div>
 
@@ -649,6 +728,7 @@
 							<VersionReviewForm
 								bind:note={reviewNote}
 								{submitting}
+								intent={reviewIntent}
 								onApprove={() => review(doc.document_id, doc.version_id ?? '', true)}
 								onReject={() => review(doc.document_id, doc.version_id ?? '', false)}
 								onCancel={() => (reviewingId = null)}
@@ -688,7 +768,7 @@
 												<button
 													type="button"
 													class="cursor-pointer"
-													title={$i18n.t('Approve')}
+													title={$i18n.t('Review version')}
 													on:click={() => openReview(version.id)}
 												>
 													<Badge
@@ -754,6 +834,7 @@
 											<VersionReviewForm
 												bind:note={reviewNote}
 												{submitting}
+												intent={reviewIntent}
 												onApprove={() => review(doc.document_id, version.id, true)}
 												onReject={() => review(doc.document_id, version.id, false)}
 												onCancel={() => (reviewingId = null)}
