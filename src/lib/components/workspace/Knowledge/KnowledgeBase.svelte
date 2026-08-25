@@ -47,8 +47,10 @@
 		moveFileInKnowledge,
 		syncKnowledgeDiff,
 		syncKnowledgeCleanup,
-		testExternalKnowledgeRetrieval
+		testExternalKnowledgeRetrieval,
+		getKnowledgeTags
 	} from '$lib/apis/knowledge';
+	import type { KnowledgeTag } from '$lib/apis/knowledge';
 	import { processWeb, processYoutubeVideo } from '$lib/apis/retrieval';
 
 	import { blobToFile, isYoutubeUrl } from '$lib/utils';
@@ -57,6 +59,7 @@
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Files from './KnowledgeBase/Files.svelte';
 	import DocumentRegistry from './KnowledgeBase/DocumentRegistry.svelte';
+	import TagChip from './KnowledgeBase/TagChip.svelte';
 
 	// Tier membership never reaches the client, so "may review" is asked as a
 	// permission — the seeded Мастер-эксперт group carries workspace.knowledge_review
@@ -798,6 +801,32 @@
 	// sidebar while already on this screen changed the address bar and nothing
 	// else: the component is not remounted for a query-string change.
 
+	// Tags the registry is narrowed to. Owned here rather than in the registry so
+	// the filter bar above the list and the chips inside it are one piece of
+	// state — clicking a chip in a row and clearing it from the bar have to be
+	// the same operation.
+	let activeTagIds: string[] = [];
+	let activeTags: KnowledgeTag[] = [];
+
+	const toggleTagFilter = (tagId: string) => {
+		activeTagIds = activeTagIds.includes(tagId)
+			? activeTagIds.filter((id) => id !== tagId)
+			: [...activeTagIds, tagId];
+	};
+
+	// The bar needs labels and descriptions, which a bare id does not carry.
+	// Fetched once and looked up, rather than kept in sync with every row.
+	let tagVocabulary: KnowledgeTag[] = [];
+	$: activeTags = activeTagIds.map(
+		(id) =>
+			tagVocabulary.find((tag) => tag.id === id) ?? {
+				id,
+				label: id,
+				created_at: 0,
+				updated_at: 0
+			}
+	);
+
 	const applyDirectory = (directoryId: string | null) => {
 		currentDirectoryId = directoryId;
 		currentPage = 1;
@@ -1173,6 +1202,14 @@
 	};
 
 	onMount(async () => {
+		// The vocabulary, for the filter bar's labels and descriptions. Failure is
+		// silent: chips still render their id, which is the readable part anyway.
+		getKnowledgeTags(localStorage.token)
+			.then((tags) => {
+				tagVocabulary = tags;
+			})
+			.catch(() => {});
+
 		// listen to resize 1024px
 		mediaQuery = window.matchMedia('(min-width: 1024px)');
 
@@ -1645,6 +1682,25 @@
 					</div>
 				</div>
 
+				{#if activeTagIds.length > 0}
+					<!-- Only rendered when something is active: an always-present empty
+					     bar would push the list down for the majority of visits, and the
+					     chips in each row are how a filter gets started. -->
+					<div class="px-5 mt-2 flex flex-wrap items-center gap-1.5">
+						<span class="text-xs text-gray-500">{$i18n.t('Filtered by')}:</span>
+						{#each activeTags as tag (tag.id)}
+							<TagChip {tag} active onRemove={(t) => toggleTagFilter(t.id)} />
+						{/each}
+						<button
+							type="button"
+							class="text-xs text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition"
+							on:click={() => (activeTagIds = [])}
+						>
+							{$i18n.t('Clear')}
+						</button>
+					</div>
+				{/if}
+
 				{#if currentDirectoryId !== null && breadcrumbs.length > 0}
 					<div class="px-5 mt-2">
 						<KnowledgeBreadcrumbs
@@ -1693,6 +1749,9 @@
 												onMoveDirectory={(dirId, targetId) => moveDirectoryHandler(dirId, targetId)}
 												onMoveDocument={(documentId, targetId) =>
 													moveDocumentToDirectoryHandler(documentId, targetId)}
+												{activeTagIds}
+												canCurateTags={canReviewVersions}
+												onToggleTag={(tagId) => toggleTagFilter(tagId)}
 												onTree={(crumbs) => {
 													breadcrumbs = crumbs;
 												}}

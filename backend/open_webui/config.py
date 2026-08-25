@@ -165,6 +165,19 @@ async def seed_knowledge_bases():
     await Knowledges.seed_defaults(SEED_KNOWLEDGE_BASES)
 
 
+# ── The tag vocabulary ────────────────────────────────────────────────
+#
+# Seeded, not free-form: one canonical spelling per concept is what makes
+# tag-driven retrieval work, and «ГОСТ»/«гост»/«gost» as three tags would
+# quietly undo it. Admins and Мастер-эксперт can add more through the UI;
+# see knowledge_taxonomy.py for the list and the rule used to choose it.
+async def seed_knowledge_tags():
+    from open_webui.knowledge_taxonomy import seed_tag_rows
+    from open_webui.models.knowledge_tags import KnowledgeTags
+
+    await KnowledgeTags.seed_defaults(seed_tag_rows())
+
+
 async def async_reset_config():
     await Config.clear()
 

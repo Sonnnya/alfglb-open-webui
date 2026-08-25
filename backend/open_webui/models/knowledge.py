@@ -14,6 +14,7 @@ from open_webui.models.files import (
     FileModelResponse,
 )
 from open_webui.models.groups import Groups
+from open_webui.models.knowledge_tags import KnowledgeTagModel, KnowledgeTags
 from open_webui.models.users import User, UserModel, UserResponse, Users
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import (
@@ -306,6 +307,11 @@ class KnowledgeDocumentResponse(BaseModel):
     status: VersionStatus
     comment: Optional[str] = None
     review_note: Optional[str] = None
+
+    # Every tag on the document, ordered by id so a branch reads together.
+    # Attached to the document, not this version: a tag says what the document is
+    # about, which survives a revision.
+    tags: list[KnowledgeTagModel] = Field(default_factory=list)
 
     author: Optional[UserResponse] = None
     # Who created the *document*. Deliberately not the same as `author`, which is
@@ -1005,6 +1011,16 @@ class KnowledgeTable:
                 )
                 stmt = stmt.filter(effective_status == status_filter)
 
+            # Tag filter. Resolved to a document-id list first rather than joined
+            # in: the filter is AND-across-tags and subtree-inclusive, which as a
+            # join would need one join per tag plus a prefix predicate on each.
+            # None means "no filter asked for"; [] means "asked, nothing matched".
+            tag_ids = filter.get('tag_ids')
+            if tag_ids:
+                matched = await KnowledgeTags.document_ids_with_tags(tag_ids, db=db)
+                if matched is not None:
+                    stmt = stmt.filter(KnowledgeFile.id.in_(matched))
+
             directory_id = filter.get('directory_id') if 'directory_id' in filter else None
             if 'directory_id' in filter:
                 if directory_id:
@@ -1020,6 +1036,11 @@ class KnowledgeTable:
             stmt = stmt.options(defer(File.data))
 
             rows = (await db.execute(stmt)).all()
+
+            # One query for the whole page rather than one per row.
+            tags_by_document = await KnowledgeTags.get_tags_for_documents(
+                [document.id for document, _, _, _ in rows], db=db
+            )
 
             in_folder_mode = 'directory_id' in filter
             return KnowledgeDocumentListResponse(
@@ -1051,6 +1072,7 @@ class KnowledgeTable:
                         ),
                         comment=ver.comment if ver else None,
                         review_note=ver.review_note if ver else None,
+                        tags=tags_by_document.get(document.id, []),
                         author=(UserResponse(**UserModel.model_validate(author).model_dump()) if author else None),
                         owner_id=document.user_id,
                         is_published=bool(document.file_id) and document.file_id == (ver.file_id if ver else file.id),
@@ -1364,6 +1386,12 @@ class KnowledgeTable:
             file_ids = list(
                 dict.fromkeys([fid for fid in version_files if fid] + ([document.file_id] if document.file_id else []))
             )
+
+            # Tag links go the same way and for the same reason: the CASCADE on
+            # knowledge_file_tag.knowledge_file_id fires on Postgres and not on
+            # SQLite, and a stranded link would keep the document in every tag
+            # count while the document itself no longer exists.
+            await KnowledgeTags.delete_tags_for_documents([document_id], db=db)
 
             await db.execute(delete(KnowledgeFileVersion).filter_by(knowledge_file_id=document_id))
             await db.execute(delete(KnowledgeFile).filter_by(id=document_id))

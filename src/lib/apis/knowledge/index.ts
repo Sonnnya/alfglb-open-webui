@@ -1224,13 +1224,16 @@ type KnowledgeDocumentQuery = {
 	query?: string;
 	status?: string;
 	directoryId?: string | null;
+	// Repeated, not comma-joined: a tag id may itself contain '/', and FastAPI
+	// reads a repeated query param straight into list[str].
+	tagIds?: string[];
 	page?: number;
 };
 
 export const getKnowledgeDocuments = async (
 	token: string,
 	id: string,
-	{ query, status, directoryId, page }: KnowledgeDocumentQuery = {}
+	{ query, status, directoryId, tagIds, page }: KnowledgeDocumentQuery = {}
 ) => {
 	let error = null;
 
@@ -1241,6 +1244,7 @@ export const getKnowledgeDocuments = async (
 	if (directoryId !== undefined && directoryId !== null) {
 		searchParams.append('directory_id', directoryId);
 	}
+	for (const tagId of tagIds ?? []) searchParams.append('tag_ids', tagId);
 	if (page !== undefined) searchParams.append('page', `${page}`);
 
 	const res = await fetch(
@@ -1405,3 +1409,145 @@ export const approveVersion = (
 
 export const rejectVersion = (token: string, id: string, versionId: string, note?: string | null) =>
 	reviewVersion(token, id, versionId, 'reject', note);
+
+// ── Tags ──────────────────────────────────────────────────────────────
+//
+// The vocabulary is shared across the whole deployment rather than scoped to a
+// knowledge base, so these live at /knowledge/tags rather than under an id.
+
+export type KnowledgeTag = {
+	id: string;
+	label: string;
+	description?: string | null;
+	user_id?: string | null;
+	// `aliases` / `code` / `deprecated` come from the canonical registry and are
+	// carried for tag-aware retrieval; nothing in the UI reads them yet.
+	meta?: {
+		system?: boolean;
+		group?: string;
+		group_order?: number;
+		code?: string;
+		aliases?: string[];
+		deprecated?: string[];
+	} | null;
+	created_at: number;
+	updated_at: number;
+	count?: number;
+};
+
+export const getKnowledgeTags = async (token: string): Promise<KnowledgeTag[]> => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/knowledge/tags`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			authorization: `Bearer ${token}`
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail;
+			console.error(err);
+			return null;
+		});
+
+	if (error) throw error;
+	return res;
+};
+
+export const createKnowledgeTag = async (
+	token: string,
+	form: { label: string; id?: string; description?: string }
+) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/knowledge/tags/create`, {
+		method: 'POST',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			authorization: `Bearer ${token}`
+		},
+		body: JSON.stringify(form)
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail;
+			console.error(err);
+			return null;
+		});
+
+	if (error) throw error;
+	return res;
+};
+
+export const deleteKnowledgeTag = async (token: string, tagId: string) => {
+	let error = null;
+
+	// NOT encodeURIComponent: a tag id contains '/' as a real path separator and
+	// the route is declared as {tag_id:path}. Encoding the slashes would send
+	// %2F, which never matches.
+	const res = await fetch(`${WEBUI_API_BASE_URL}/knowledge/tags/${tagId}`, {
+		method: 'DELETE',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			authorization: `Bearer ${token}`
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail;
+			console.error(err);
+			return null;
+		});
+
+	if (error) throw error;
+	return res;
+};
+
+export const setKnowledgeDocumentTags = async (
+	token: string,
+	knowledgeId: string,
+	documentId: string,
+	tagIds: string[]
+): Promise<KnowledgeTag[]> => {
+	let error = null;
+
+	// The complete set, not a delta — see DocumentTagsForm on the backend.
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/knowledge/${knowledgeId}/document/${documentId}/tags`,
+		{
+			method: 'POST',
+			headers: {
+				Accept: 'application/json',
+				'Content-Type': 'application/json',
+				authorization: `Bearer ${token}`
+			},
+			body: JSON.stringify({ tag_ids: tagIds })
+		}
+	)
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail;
+			console.error(err);
+			return null;
+		});
+
+	if (error) throw error;
+	return res;
+};

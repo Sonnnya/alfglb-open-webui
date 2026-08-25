@@ -24,7 +24,8 @@
 		deleteKnowledgeVersion,
 		getDocumentVersions,
 		getKnowledgeDocuments,
-		rejectVersion
+		rejectVersion,
+		setKnowledgeDocumentTags
 	} from '$lib/apis/knowledge';
 	import { uploadFile } from '$lib/apis/files';
 	import { user } from '$lib/stores';
@@ -34,6 +35,8 @@
 	import VersionReviewForm from './VersionReviewForm.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Badge from '$lib/components/common/Badge.svelte';
+	import TagChip from './TagChip.svelte';
+	import TagEditor from './TagEditor.svelte';
 	import DocumentPage from '$lib/components/icons/DocumentPage.svelte';
 	import DirectoryRow from './DirectoryRow.svelte';
 
@@ -65,11 +68,20 @@
 	 * The folder being shown. `null` means the root level; the registry is then a
 	 * file manager rather than a flat list.
 	 *
-	 * A search overrides it — see load(): people searching want hits from the whole
-	 * base, not from the folder they happen to be standing in, so a non-empty query
-	 * drops the scoping and the folder rows with it.
+	 * A search or a tag filter overrides it — see load(): people searching want hits
+	 * from the whole base, not from the folder they happen to be standing in, so
+	 * either one drops the scoping and the folder rows with it.
 	 */
 	export let directoryId: string | null = null;
+	// Tags the list is currently narrowed to, owned by the parent so the filter
+	// bar and the chips agree about what is active.
+	export let activeTagIds: string[] = [];
+	export let canCurateTags = false;
+	export let onToggleTag: (tagId: string) => void = () => {};
+
+	// Which document's tag editor is open. One at a time: the editor is tall and
+	// two open at once would push the row you were comparing off screen.
+	let editingTagsFor: string | null = null;
 	/** Whether the viewer may create, rename, move or delete folders. */
 	export let writeAccess = false;
 
@@ -106,11 +118,15 @@
 		loading = true;
 		// directoryId is sent as '' for the root — the API distinguishes "omitted"
 		// (flat across every folder) from "explicitly root". A search deliberately
-		// omits it so results span the whole base.
-		const searching = (query ?? '').trim().length > 0;
+		// omits it so results span the whole base, and a tag filter does the same:
+		// both are questions about the corpus, not about the folder you happen to
+		// be standing in. Keeping the scope would also draw folder rows above a
+		// filtered list, implying the folders themselves had been filtered.
+		const flattened = (query ?? '').trim().length > 0 || activeTagIds.length > 0;
 		const res = await getKnowledgeDocuments(localStorage.token, knowledgeId, {
 			query: query || undefined,
-			directoryId: searching ? undefined : (directoryId ?? ''),
+			directoryId: flattened ? undefined : (directoryId ?? ''),
+			tagIds: activeTagIds,
 			page
 		}).catch((e) => {
 			toast.error(`${e}`);
@@ -139,9 +155,25 @@
 
 	// Debounced here rather than in the parent: the parent's handler also refetches
 	// the legacy /files list, and the two want different timing.
+
 	let appliedDirectoryId = directoryId;
 	$: if (directoryId !== appliedDirectoryId) {
 		appliedDirectoryId = directoryId;
+		if (page !== 1) {
+			page = 1;
+		} else {
+			load();
+		}
+	}
+
+	// The tag filter reloads the list, exactly as a folder change does. Keyed on
+	// the joined ids rather than the array itself: the parent rebuilds the array
+	// on every toggle, so comparing identity would reload on every render. A
+	// space is a safe separator because normalize_tag_id turns spaces into
+	// underscores, so no tag id can contain one.
+	let appliedTagKey = activeTagIds.join(' ');
+	$: if (activeTagIds.join(' ') !== appliedTagKey) {
+		appliedTagKey = activeTagIds.join(' ');
 		if (page !== 1) {
 			page = 1;
 		} else {
@@ -373,6 +405,25 @@
 
 	// Status drives the badge colour and label. Literal t() calls, because
 	// i18next-parser only sees literals and drops any key it cannot find.
+	// Writes the whole set, then patches the row in place rather than reloading
+	// the page: a refresh would collapse «История» and lose the scroll position
+	// for a change that touches exactly one row.
+	const saveTags = async (documentId: string, tagIds: string[]) => {
+		try {
+			const tags = await setKnowledgeDocumentTags(
+				localStorage.token,
+				knowledgeId,
+				documentId,
+				tagIds
+			);
+			documents = documents.map((item) =>
+				item.document_id === documentId ? { ...item, tags } : item
+			);
+		} catch (e) {
+			toast.error(`${e}`);
+		}
+	};
+
 	const statusLabel = (status: string) =>
 		status === 'approved'
 			? $i18n.t('Approved')
@@ -497,6 +548,33 @@
 								{#if doc.author?.name}· {doc.author.name}{/if}
 								{#if doc.comment}· {doc.comment}{/if}
 							</div>
+
+							<!-- Tags sit under the filename rather than beside it: a document
+							     can carry half a dozen, and squeezing them into the same line
+							     as the version badge and four controls would truncate both. -->
+							{#if doc.tags?.length || canUpload}
+								<div class="flex flex-wrap items-center gap-1 mt-1">
+									{#each doc.tags ?? [] as tag (tag.id)}
+										<TagChip
+											{tag}
+											active={activeTagIds.includes(tag.id)}
+											onClick={(t) => onToggleTag(t.id)}
+										/>
+									{/each}
+
+									{#if canUpload}
+										<button
+											type="button"
+											class="text-xs text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition"
+											on:click|stopPropagation={() =>
+												(editingTagsFor =
+													editingTagsFor === doc.document_id ? null : doc.document_id)}
+										>
+											{doc.tags?.length ? $i18n.t('Edit tags') : `# ${$i18n.t('Add tags')}`}
+										</button>
+									{/if}
+								</div>
+							{/if}
 						</div>
 
 						<div class="flex items-center gap-1.5 shrink-0">
@@ -554,6 +632,17 @@
 							{/if}
 						</div>
 					</div>
+
+					{#if editingTagsFor === doc.document_id}
+						<div class="ml-7">
+							<TagEditor
+								selected={doc.tags ?? []}
+								canCurate={canCurateTags}
+								onSave={(tagIds) => saveTags(doc.document_id, tagIds)}
+								onClose={() => (editingTagsFor = null)}
+							/>
+						</div>
+					{/if}
 
 					{#if reviewingId === doc.version_id}
 						<div class="ml-7">

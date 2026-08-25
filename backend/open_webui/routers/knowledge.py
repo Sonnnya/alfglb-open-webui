@@ -21,24 +21,32 @@ from open_webui.models.config import Config
 from open_webui.models.files import FileMetadataResponse, FileModel, FileModelResponse, Files
 from open_webui.models.groups import Groups
 from open_webui.models.knowledge import (
+    VERSION_STATUS_APPROVED,
+    VERSION_STATUS_PENDING,
+    VERSION_STATUS_REJECTED,
     KnowledgeDirectoryForm,
     KnowledgeDirectoryModel,
+    KnowledgeDocumentListResponse,
     KnowledgeFileListResponse,
+    KnowledgeFileVersionModel,
     KnowledgeForm,
     KnowledgeResponse,
     Knowledges,
     KnowledgeUserResponse,
-    KnowledgeDocumentListResponse,
-    KnowledgeFileVersionModel,
     KnowledgeVersionResponse,
-    VERSION_STATUS_APPROVED,
-    VERSION_STATUS_PENDING,
-    VERSION_STATUS_REJECTED,
     is_system_knowledge,
 )
+from open_webui.models.knowledge_tags import (
+    DocumentTagsForm,
+    KnowledgeTagForm,
+    KnowledgeTagModel,
+    KnowledgeTagResponse,
+    KnowledgeTags,
+    is_system_tag,
+)
 from open_webui.models.models import ModelForm, Models
-from open_webui.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
 from open_webui.retrieval.external import retrieve_external_knowledge, retrieve_external_knowledge_for_connection
+from open_webui.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
 from open_webui.routers.files import build_file_content_response
 from open_webui.routers.retrieval import (
     BatchProcessFilesForm,
@@ -1049,6 +1057,87 @@ async def update_external_knowledge_source(
 class KnowledgeFilesResponse(KnowledgeResponse):
     files: list[FileMetadataResponse | None] = None
     write_access: bool | None = False
+
+
+############################
+# Tags
+############################
+#
+# Declared BEFORE /{id}. FastAPI matches routes in declaration order, so a
+# literal path registered after a parameterised one is unreachable — GET /tags
+# would arrive at get_knowledge_by_id with id='tags'.
+
+
+async def _require_knowledge_workspace(user, db) -> None:
+    """The registry's audience: admins and both expert tiers.
+
+    Same expression _load_kb_for uses, but tags are vocabulary rather than the
+    contents of one base, so there is no knowledge id to resolve access against.
+    """
+    if user.role != 'admin' and not await has_permission(
+        user.id, 'workspace.knowledge', await Config.get('user.permissions'), db=db
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
+
+
+async def _require_tag_curator(user, db) -> None:
+    """Minting and removing vocabulary is a Мастер-эксперт / admin act.
+
+    Deliberately narrower than attaching a tag, which any holder of write access
+    may do. A wrong tag on a document is one click to fix; a near-duplicate tag
+    («гост» beside «ГОСТ») silently splits the corpus in two and is exactly what
+    a controlled vocabulary exists to prevent.
+    """
+    if not await _may_review(user, db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
+
+
+@router.get('/tags', response_model=list[KnowledgeTagResponse])
+async def get_knowledge_tags(
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """The whole vocabulary with usage counts, ordered so branches read together."""
+    await _require_knowledge_workspace(user, db)
+    return await KnowledgeTags.get_tags(db=db)
+
+
+@router.post('/tags/create', response_model=KnowledgeTagModel)
+async def create_knowledge_tag(
+    form_data: KnowledgeTagForm,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    await _require_tag_curator(user, db)
+    tag = await KnowledgeTags.create_tag(form_data, user.id, db=db)
+    if not tag:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='A tag needs a name.',
+        )
+    return tag
+
+
+# ':path' because a tag id CONTAINS slashes — 'сварка/лучевая/лазерная' is one
+# id, not three path segments. Without the converter the route never matches.
+@router.delete('/tags/{tag_id:path}', response_model=bool)
+async def delete_knowledge_tag(
+    tag_id: str,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    await _require_tag_curator(user, db)
+    tag = await KnowledgeTags.get_tag_by_id(tag_id, db=db)
+    if not tag:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+    if is_system_tag(tag):
+        # The seeded taxonomy is not the operator's to remove, same rule as the
+        # seeded knowledge base and the tier groups. Relabelling one is fine.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='This tag is part of the seeded vocabulary and cannot be deleted.',
+        )
+    return await KnowledgeTags.delete_tag(tag_id, db=db)
 
 
 @router.get('/{id}', response_model=KnowledgeFilesResponse | None)
@@ -2937,6 +3026,7 @@ async def get_knowledge_documents(
     query: str | None = None,
     status_filter: str | None = Query(None, alias='status'),
     directory_id: str | None = Query(None, description='Omit for a flat list across all folders.'),
+    tag_ids: list[str] | None = Query(None, description='Repeat to narrow by several tags (AND).'),
     page: int | None = 1,
     limit: int | None = Query(None, description='Page size (admin only). Defaults to 30.'),
     user=Depends(get_verified_user),
@@ -2967,5 +3057,33 @@ async def get_knowledge_documents(
         filter['status'] = status_filter
     if directory_id is not None:
         filter['directory_id'] = directory_id or None
+    if tag_ids:
+        filter['tag_ids'] = tag_ids
 
     return await Knowledges.search_documents_by_id(id, filter=filter, skip=(page - 1) * limit, limit=limit, db=db)
+
+
+@router.post('/{id}/document/{document_id}/tags', response_model=list[KnowledgeTagModel])
+async def set_knowledge_document_tags(
+    id: str,
+    document_id: str,
+    form_data: DocumentTagsForm,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Replace a document's tag set.
+
+    Write access to the base, not ownership of the document and not review
+    rights: tagging is cheap to correct, and an untagged corpus costs far more
+    than an occasional wrong tag. Creating new vocabulary stays gated — unknown
+    ids in the payload are ignored rather than minted.
+    """
+    await _load_kb_for(id, user, 'write', db)
+
+    document = await Knowledges.get_document_by_id(document_id, db=db)
+    if not document or document.knowledge_id != id:
+        # The knowledge_id check is what stops a write grant on one base being
+        # used to retag a document in another.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    return await KnowledgeTags.set_document_tags(document_id, form_data.tag_ids, user.id, db=db)

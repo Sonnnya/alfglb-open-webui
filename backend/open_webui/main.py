@@ -69,6 +69,7 @@ from open_webui.config import (
     async_reset_config,
     import_legacy_config_json,
     seed_knowledge_bases,
+    seed_knowledge_tags,
     seed_registered_defaults,
     seed_tier_groups,
 )
@@ -320,6 +321,7 @@ async def lifespan(app: FastAPI):
     await seed_tier_groups()
     # After the groups: the seeded knowledge base grants access to them by id.
     await seed_knowledge_bases()
+    await seed_knowledge_tags()
     await initialize_runtime_config(app)
     await migrate_legacy_webhook_config()
     await publish_event(app, EVENTS.SYSTEM_STARTUP_STARTED, source='system')
