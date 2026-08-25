@@ -71,6 +71,7 @@
 	import AddTextContentModal from './KnowledgeBase/AddTextContentModal.svelte';
 	import NewDirectoryModal from './KnowledgeBase/NewDirectoryModal.svelte';
 	import NewFolderAlt from '$lib/components/icons/NewFolderAlt.svelte';
+	import FolderOpen from '$lib/components/icons/FolderOpen.svelte';
 	import KnowledgeBreadcrumbs from './KnowledgeBase/KnowledgeBreadcrumbs.svelte';
 
 	import SyncConfirmDialog from '../../common/ConfirmDialog.svelte';
@@ -100,12 +101,24 @@
 	let showSyncConfirmModal = false;
 	let pendingSyncFiles: Array<{ path: string; filename: string; file: File }> | null = null;
 	let syncing: string | null = null;
+	// Covers the window `syncing` cannot: uploadDirectoryHandler awaits the native
+	// picker and the whole tree walk before uploadDirectoryEntries sets `syncing`,
+	// so the button would otherwise stay live through all of it. Two concurrent
+	// runs race on createMissingDirectories: both read the same directory_map, both
+	// try to create the same folders, and the loser's /dirs/create hits the
+	// (knowledge_id, parent_id, name) constraint and aborts its whole upload.
+	let pickingDirectory = false;
 	let showAccessControlModal = false;
 	let showResetConfirm = false;
 
 	let minSize = 0;
 	type DirectoryFileEntry = { path: string; filename: string; file: File };
 	type DirectoryManifestEntry = DirectoryFileEntry & { checksum: string; size: number };
+	// Folders are carried separately from files because the server cannot infer
+	// them: POST /{id}/sync/diff derives its `mkdir` list from the paths of the
+	// files in the manifest, so a folder holding no files anywhere below it is
+	// invisible to it. `directories` is every folder the picker walked into.
+	type DirectoryScan = { files: DirectoryFileEntry[]; directories: string[] };
 
 	type Knowledge = {
 		id: string;
@@ -495,9 +508,11 @@
 	};
 
 	const uploadDirectoryHandler = async () => {
-		const entries = await collectDirectoryFiles();
-		if (entries?.length) {
-			await uploadDirectoryEntries(entries);
+		const scan = await collectDirectoryFiles();
+		// Folders on their own are a legitimate upload — recreating an empty tree
+		// to file documents into afterwards is the main reason this button exists.
+		if (scan?.files.length || scan?.directories.length) {
+			await uploadDirectoryEntries(scan.files, scan.directories);
 		}
 	};
 
@@ -517,13 +532,14 @@
 	};
 
 	// Collect files from a directory without uploading.
-	const collectDirectoryFiles = async (): Promise<DirectoryFileEntry[] | null> => {
+	const collectDirectoryFiles = async (): Promise<DirectoryScan | null> => {
 		const isFileSystemAccessSupported = 'showDirectoryPicker' in window;
 
 		try {
 			if (isFileSystemAccessSupported) {
 				const dirHandle = await window.showDirectoryPicker();
-				const collected: DirectoryFileEntry[] = [];
+				const files: DirectoryFileEntry[] = [];
+				const directories: string[] = [];
 
 				async function traverse(handle: FileSystemDirectoryHandle, dirPath = '') {
 					for await (const entry of handle.values()) {
@@ -533,15 +549,20 @@
 
 						if (entry.kind === 'file') {
 							const file = await entry.getFile();
-							collected.push({ path: dirPath, filename: entry.name, file });
+							files.push({ path: dirPath, filename: entry.name, file });
 						} else if (entry.kind === 'directory') {
+							directories.push(entryPath);
 							await traverse(entry, entryPath);
 						}
 					}
 				}
 
-				await traverse(dirHandle, dirHandle.name);
-				return collected;
+				// '' rather than dirHandle.name: the folder you pick is the one whose
+				// CONTENTS are being uploaded, not a folder to recreate inside the base.
+				// There is no multi-directory picker on the web, so picking the parent
+				// and dropping it is how you upload several folders at once.
+				await traverse(dirHandle, '');
+				return { files, directories };
 			} else {
 				// Firefox fallback
 				return new Promise((resolve, reject) => {
@@ -562,12 +583,18 @@
 							const collected = files.map((file) => {
 								const parts = file.webkitRelativePath.split('/');
 								const filename = parts.pop() || file.name;
-								const path = parts.join('/');
+								// slice(1) drops the picked folder's own name, which
+								// webkitRelativePath always prefixes — same rule as the
+								// showDirectoryPicker branch above.
+								const path = parts.slice(1).join('/');
 								return { path, filename, file };
 							});
 
 							document.body.removeChild(input);
-							resolve(collected);
+							// No `directories`: a webkitdirectory input reports FILES only,
+							// so an empty folder does not exist as far as this branch is
+							// concerned. Folders implied by file paths still get created.
+							resolve({ files: collected, directories: [] });
 						} catch (error) {
 							document.body.removeChild(input);
 							reject(error);
@@ -600,12 +627,35 @@
 		);
 	};
 
-	const createMissingDirectories = async (diff: any) => {
+	const createMissingDirectories = async (diff: any, scannedPaths: string[] = []) => {
 		if (!knowledge) return {};
 
 		const directoryIdByPath: Record<string, string> = { ...(diff.directory_map || {}) };
 
-		for (const dirPath of diff.mkdir) {
+		// diff.mkdir is what the FILES imply; scannedPaths is every folder the picker
+		// actually walked into, which is the only way an empty one gets here. Both are
+		// full paths from the base root, so diff.directory_map decides what already
+		// exists and re-uploading the same tree creates no FOLDER twice.
+		//
+		// Files are a different story and this does not make them idempotent: the diff
+		// indexes existing files through get_files_with_directory_ids, which joins on
+		// KnowledgeFile.file_id and so sees only PUBLISHED ones. Every document still
+		// awaiting review is invisible to it, and a re-upload adds it again as a
+		// second pending document.
+		const wanted = [...diff.mkdir, ...scannedPaths.map(getDirectoryUploadPath)];
+		const missing = [...new Set<string>(wanted)].filter((path) => path && !directoryIdByPath[path]);
+		// Shallowest first — a folder cannot be created before its parent has an id.
+		// The server already sorts diff.mkdir this way; merging in scannedPaths
+		// requires re-sorting the union.
+		missing.sort((a, b) => a.split('/').length - b.split('/').length);
+
+		let created = 0;
+		for (const dirPath of missing) {
+			syncing = $i18n.t('Creating folders {{current}}/{{total}}', {
+				current: ++created,
+				total: missing.length
+			});
+
 			const segments = dirPath.split('/');
 			const name = segments.at(-1)!;
 			const parentPath = segments.slice(0, -1).join('/');
@@ -617,9 +667,14 @@
 				name,
 				parentId
 			);
-			if (directory) {
-				directoryIdByPath[dirPath] = directory.id;
+			if (!directory) {
+				// createKnowledgeDirectory resolves to null rather than throwing, so an
+				// unchecked failure loses this folder AND everything below it to the base
+				// root — silently. Abort instead; folders already made are found in
+				// directory_map on the next attempt.
+				throw new Error($i18n.t('Failed to create folder: {{path}}', { path: dirPath }));
 			}
+			directoryIdByPath[dirPath] = directory.id;
 		}
 
 		return directoryIdByPath;
@@ -630,7 +685,10 @@
 		return currentPath && path ? `${currentPath}/${path}` : currentPath || path;
 	};
 
-	const uploadDirectoryEntries = async (entries: DirectoryFileEntry[]) => {
+	const uploadDirectoryEntries = async (
+		entries: DirectoryFileEntry[],
+		scannedPaths: string[] = []
+	) => {
 		if (!knowledge) return;
 
 		try {
@@ -654,7 +712,11 @@
 				return;
 			}
 
-			const directoryIdByPath = await createMissingDirectories(diff);
+			// Passed even when the manifest is empty: the diff is what tells us which
+			// folders the base ALREADY has (directory_map), which is the whole reason
+			// to call it on a folders-only upload. Nothing here acts on diff.deleted
+			// or diff.rmdir, so an empty manifest removes nothing.
+			const directoryIdByPath = await createMissingDirectories(diff, scannedPaths);
 
 			let uploadedCount = 0;
 			for (const entry of manifest) {
@@ -679,7 +741,16 @@
 				});
 			}
 
-			toast.success($i18n.t('File uploaded successfully'));
+			toast.success(
+				manifest.length
+					? $i18n.t('File uploaded successfully')
+					: $i18n.t('Folders created successfully')
+			);
+			// The sidebar tree owns its own copy of the folder list, fetched from
+			// /dirs — createMissingDirectories() went straight to the API rather
+			// than through createDirectoryHandler, so nothing has told it that a
+			// whole subtree appeared. init() only refreshes this screen.
+			knowledgeDirectoryRevision.update((n) => n + 1);
 			init();
 		} catch (e) {
 			toast.error(`${e}`);
@@ -1590,7 +1661,7 @@
 										}
 									}}
 									onSync={async () => {
-										pendingSyncFiles = await collectDirectoryFiles();
+										pendingSyncFiles = (await collectDirectoryFiles())?.files ?? null;
 										if (pendingSyncFiles?.length) {
 											showSyncConfirmModal = true;
 										}
@@ -1614,6 +1685,39 @@
 								<NewFolderAlt className="size-4" />
 								{$i18n.t('Create folder')}
 							</button>
+
+							<!-- Admin-only, and cosmetically so — like every other gate in this
+							     tree. It drives the pre-existing uploadDirectoryHandler(), which
+							     reaches POST /{id}/dirs/create (gated by
+							     _verify_knowledge_write_access) and POST /files/ (whose
+							     knowledge auto-link gates on the same write grant), so an
+							     Эксперт could still do all of this over HTTP. The restriction is
+							     about who should be reshaping the folder tree wholesale, not
+							     about what the server will accept.
+
+							     Empty folders included — the picker reports them and they are
+							     sent alongside the files, because the server derives folders
+							     from file paths alone and cannot see one that holds nothing.
+							     The exception is Firefox, whose webkitdirectory fallback
+							     reports files only. -->
+							{#if $user?.role === 'admin'}
+								<button
+									class="px-3 py-1.5 rounded-xl border border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-850 transition font-medium text-sm flex items-center gap-1.5 shrink-0 disabled:opacity-50"
+									type="button"
+									disabled={!!syncing || pickingDirectory}
+									on:click={async () => {
+										pickingDirectory = true;
+										try {
+											await uploadDirectoryHandler();
+										} finally {
+											pickingDirectory = false;
+										}
+									}}
+								>
+									<FolderOpen className="size-4" strokeWidth="2" />
+									{$i18n.t('Upload directory')}
+								</button>
+							{/if}
 						{/if}
 					</div>
 				</div>
