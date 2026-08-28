@@ -58,6 +58,7 @@ from open_webui.tools.builtin import (
     fetch_url,
     generate_image,
     get_current_timestamp,
+    get_electrode_info,
     grep_knowledge_files,
     kb_exec,
     list_automations,
@@ -68,6 +69,7 @@ from open_webui.tools.builtin import (
     query_knowledge_bases,
     query_knowledge_files,
     read_memory_path,
+    recommend_electrodes,
     replace_memory_content,
     replace_note_content,
     search_calendar_events,
@@ -510,6 +512,14 @@ async def get_builtin_tools(
     if is_builtin_tool_enabled('time'):
         builtin_functions.extend([get_current_timestamp, calculate_timestamp])
 
+    # Welding consumables - static files shipped with the package, so there is
+    # nothing to gate beyond the per-model toggle: no config key, no user data,
+    # no cost. One toggle for both, as with the time tools above: they read the
+    # same three files and are only split because "recommend me one" and "what
+    # is this one" want different answers.
+    if is_builtin_tool_enabled('electrodes'):
+        builtin_functions.extend([recommend_electrodes, get_electrode_info])
+
     # Knowledge base tools - conditional injection based on model knowledge
     # If model has attached knowledge (any type), only provide query_knowledge_files
     # Otherwise, provide all KB browsing tools
@@ -811,7 +821,6 @@ def clean_properties(schema: dict):
 
 
 def clean_openai_tool_schema(spec: dict) -> dict:
-
     cleaned_spec = copy.deepcopy(spec)
 
     if 'parameters' in cleaned_spec:
