@@ -68,6 +68,7 @@ from open_webui.tools.builtin import (
     query_knowledge_bases,
     query_knowledge_files,
     read_memory_path,
+    recommend_electrodes,
     replace_memory_content,
     replace_note_content,
     search_calendar_events,
@@ -510,6 +511,12 @@ async def get_builtin_tools(
     if is_builtin_tool_enabled('time'):
         builtin_functions.extend([get_current_timestamp, calculate_timestamp])
 
+    # Electrode catalogue - a static file shipped with the package, so there is
+    # nothing to gate beyond the per-model toggle: no config key, no user data,
+    # no cost. Same shape as the time tools above.
+    if is_builtin_tool_enabled('electrodes'):
+        builtin_functions.append(recommend_electrodes)
+
     # Knowledge base tools - conditional injection based on model knowledge
     # If model has attached knowledge (any type), only provide query_knowledge_files
     # Otherwise, provide all KB browsing tools
@@ -811,7 +818,6 @@ def clean_properties(schema: dict):
 
 
 def clean_openai_tool_schema(spec: dict) -> dict:
-
     cleaned_spec = copy.deepcopy(spec)
 
     if 'parameters' in cleaned_spec:

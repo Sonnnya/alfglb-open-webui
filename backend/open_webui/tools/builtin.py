@@ -6,6 +6,7 @@ These tools are automatically available when native function calling is enabled.
 IMPORTANT: DO NOT IMPORT THIS MODULE DIRECTLY IN OTHER PARTS OF THE CODEBASE.
 """
 
+from open_webui.tools.electrodes import recommend_electrodes  # noqa: F401 — re-exported
 from open_webui.tools.knowledge_fs import kb_exec  # noqa: F401 — re-exported
 
 import asyncio
