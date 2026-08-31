@@ -34,8 +34,20 @@
 		updated_at: number;
 		/** Documents in this folder AND everything under it. */
 		file_count?: number | null;
+		/** Of those, how many await review or came back rejected. */
+		pending_count?: number | null;
+		rejected_count?: number | null;
 	};
 	export let writeAccess = false;
+	/**
+	 * Whether the two counts above are the viewer's OWN documents rather than the
+	 * whole folder's. The backend decides it — _may_review there, canReview here —
+	 * and it reaches this row only to pick the wording: «2 отклонено» and «2 ваших
+	 * документа отклонено» are different claims, and reading the first when the
+	 * second is meant makes an Эксперт go looking for eight documents that are not
+	 * theirs.
+	 */
+	export let scopedToViewer = false;
 
 	export let onNavigate: (id: string) => void = () => {};
 	export let onRename: (id: string, name: string) => void = () => {};
@@ -157,6 +169,44 @@
 		</div>
 
 		<div class="flex items-center gap-2 shrink-0">
+			<!-- Review state, ahead of the totals: a folder with nothing pending or
+			     rejected shows nothing here at all, so the marks read as «something
+			     needs you» rather than as another column. Solid dots, not Badge's
+			     bg-*-500/20 fill — at this size a 20% wash is invisible — but the
+			     same hue as the «Ждет проверки» / «Отклонено» badges on the rows
+			     below, which is the association being borrowed.
+			     Red first: a rejected document is somebody's move to make now, a
+			     pending one is a queue. -->
+			{#if directory.rejected_count}
+				<Tooltip
+					content={scopedToViewer
+						? $i18n.t('{{count}} of your documents rejected', {
+								count: directory.rejected_count
+							})
+						: $i18n.t('{{count}} rejected', { count: directory.rejected_count })}
+				>
+					<div class="flex items-center gap-1 text-xs text-red-700 dark:text-red-200">
+						<span class="size-1.5 rounded-full bg-red-500 shrink-0" />
+						{directory.rejected_count}
+					</div>
+				</Tooltip>
+			{/if}
+
+			{#if directory.pending_count}
+				<Tooltip
+					content={scopedToViewer
+						? $i18n.t('{{count}} of your documents awaiting review', {
+								count: directory.pending_count
+							})
+						: $i18n.t('{{count}} awaiting review', { count: directory.pending_count })}
+				>
+					<div class="flex items-center gap-1 text-xs text-yellow-700 dark:text-yellow-200">
+						<span class="size-1.5 rounded-full bg-yellow-500 shrink-0" />
+						{directory.pending_count}
+					</div>
+				</Tooltip>
+			{/if}
+
 			<!-- The whole subtree, not this level: a folder that only contains
 			     folders would otherwise read «0» while holding the entire corpus.
 			     Rendered for 0 as well — an empty folder saying so is information,

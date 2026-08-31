@@ -27,7 +27,7 @@
 		rejectVersion
 	} from '$lib/apis/knowledge';
 	import { uploadFile } from '$lib/apis/files';
-	import { user } from '$lib/stores';
+	import { knowledgeDirectoryRevision, user } from '$lib/stores';
 
 	import ConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	import Pagination from '$lib/components/common/Pagination.svelte';
@@ -150,6 +150,18 @@
 	// just uploaded would not appear until a full page reload.
 	export const refresh = () => load();
 
+	// Every mutation this component performs changes a review count, and the
+	// sidebar tree draws its dots from those. It is a different component tree with
+	// no props between us, so the revision counter is the only channel — the same
+	// one folder mutations already use, because «the tree is stale» is one fact.
+	// Approving is the case that matters most: the reviewer works down the yellow
+	// dots, and a dot that does not clear as they go is worse than no dot at all.
+	//
+	// Deliberately NOT knowledgeDocumentRevision: the parent watches that one and
+	// would refetch the legacy /files list and re-run load() on top of the load()
+	// each of these has already done.
+	const notifyTree = () => knowledgeDirectoryRevision.update((n) => n + 1);
+
 	// Debounced here rather than in the parent: the parent's handler also refetches
 	// the legacy /files list, and the two want different timing.
 	let appliedDirectoryId = directoryId;
@@ -244,6 +256,7 @@
 			toast.success($i18n.t('Pending review'));
 			delete expanded[documentId];
 			await load();
+			notifyTree();
 		} catch (err) {
 			toast.error(`${err}`);
 		} finally {
@@ -303,6 +316,7 @@
 			} else {
 				await load();
 			}
+			notifyTree();
 		}
 	};
 
@@ -349,6 +363,7 @@
 			// gone — a plain history reload would render an empty panel under a row
 			// that no longer exists.
 			await load();
+			notifyTree();
 		}
 	};
 
@@ -401,6 +416,7 @@
 			delete expanded[documentId];
 			expanded = expanded;
 			await load();
+			notifyTree();
 			// Reviewing from «История» should leave «История» open, showing the
 			// verdict that was just recorded — toggleHistory refetches it.
 			if (wasExpanded) {
@@ -519,6 +535,7 @@
 					<DirectoryRow
 						{directory}
 						{writeAccess}
+						scopedToViewer={!canReview}
 						onNavigate={(dirId) => onNavigate(dirId)}
 						onRename={(dirId, name) => onRenameDirectory(dirId, name)}
 						onDelete={(dirId) => onDeleteDirectory(dirId)}

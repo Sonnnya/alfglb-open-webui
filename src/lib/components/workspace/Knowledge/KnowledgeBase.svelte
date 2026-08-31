@@ -200,6 +200,11 @@
 		// /documents, which is the only source that includes revisions awaiting
 		// review, so it has to be refreshed explicitly after every mutation.
 		documentRegistry?.refresh();
+		// And the sidebar tree, whose dots come from /dirs: a document uploaded or
+		// deleted here changes a subtree's pending count. Safe to put in the shared
+		// refresh path because init() is NOT part of mount — the tree fetches once
+		// on its own there — so this fires per mutation, not per page load.
+		knowledgeDirectoryRevision.update((n) => n + 1);
 	};
 
 	const handleSearchInput = () => {
@@ -1034,6 +1039,9 @@
 			// two cannot drift. Bumping it also keeps the server-computed folder
 			// counts honest.
 			knowledgeDocumentRevision.update((n) => n + 1);
+			// The tree's dots are subtree counts, and this document just left one
+			// subtree for another — two of them are now wrong.
+			knowledgeDirectoryRevision.update((n) => n + 1);
 		}
 	};
 
@@ -1778,7 +1786,18 @@
 					</div>
 				</div>
 
-				{#if currentDirectoryId !== null && breadcrumbs.length > 0}
+				<!-- Drawn at the root too, where `breadcrumbs` is empty and the bar is
+				     just the base's own name. A path that appears only once you are
+				     one level deep leaves the root looking like a different screen,
+				     and there is nothing to click your way back to.
+
+				     Hidden only during a SEARCH: results are gathered from the whole
+				     base, so the folder scoping is dropped and the API returns no
+				     path — a bar reading «База знаний по сварке» over hits from
+				     «ГОСТы» and «Учебники» alike would be a claim about where you
+				     are that is no longer true. Clearing the search brings it back
+				     one debounce later, which is the only visible seam. -->
+				{#if (query ?? '').trim().length === 0}
 					<div class="px-5 mt-2">
 						<KnowledgeBreadcrumbs
 							rootLabel={knowledge.name}
