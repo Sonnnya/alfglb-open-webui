@@ -25,6 +25,7 @@ from open_webui.models.knowledge import (
     VERSION_STATUS_PENDING,
     VERSION_STATUS_REJECTED,
     KnowledgeDirectoryForm,
+    KnowledgeDirectoryListResponse,
     KnowledgeDirectoryModel,
     KnowledgeDocumentListResponse,
     KnowledgeFileListResponse,
@@ -2398,7 +2399,7 @@ async def _verify_knowledge_write_access(id: str, user, db: AsyncSession):
     return knowledge
 
 
-@router.get('/{id}/dirs', response_model=list[KnowledgeDirectoryModel])
+@router.get('/{id}/dirs', response_model=KnowledgeDirectoryListResponse)
 async def list_knowledge_directories(
     id: str,
     user=Depends(get_verified_user),
@@ -2411,13 +2412,31 @@ async def list_knowledge_directories(
     tree needs all of them at once, and it is cheap: these are name+parent rows,
     not documents.
 
+    Each row also carries its subtree's pending/rejected tally, which is what the
+    tree draws its dots from. One extra GROUP BY for the whole base, not one query
+    per folder — and the tree is refetched only when something actually changes,
+    through knowledgeDirectoryRevision on the client.
+
+    The tally is scoped the same way the folder rows on the knowledge base screen
+    are: base-wide for someone who may review (it is their queue), the viewer's
+    own documents otherwise (it is their rejected revision). _may_review is the
+    single place that rule lives.
+
     Goes through _load_kb_for, so it inherits the registry's audience exactly —
     read grant plus workspace.knowledge. The sidebar entry is drawn on the same
     condition, which is what keeps an ordinary user from seeing the shape of a
     base they cannot open.
     """
     await _load_kb_for(id, user, 'read', db)
-    return await Knowledges.get_all_directories(id, db=db)
+
+    directories, base = await Knowledges.get_all_directories_with_review_counts(
+        id, viewer_id=None if await _may_review(user, db) else user.id, db=db
+    )
+    return KnowledgeDirectoryListResponse(
+        directories=directories,
+        pending_count=base.pending,
+        rejected_count=base.rejected,
+    )
 
 
 @router.post('/{id}/dirs/create', response_model=KnowledgeDirectoryModel)
@@ -3060,7 +3079,13 @@ async def get_knowledge_documents(
     if tag_ids:
         filter['tag_ids'] = tag_ids
 
-    return await Knowledges.search_documents_by_id(id, filter=filter, skip=(page - 1) * limit, limit=limit, db=db)
+    # Scopes the folder rows' pending/rejected badges only — never which documents
+    # come back. See KnowledgeDirectoryModel.pending_count.
+    viewer_id = None if await _may_review(user, db) else user.id
+
+    return await Knowledges.search_documents_by_id(
+        id, filter=filter, skip=(page - 1) * limit, limit=limit, viewer_id=viewer_id, db=db
+    )
 
 
 @router.post('/{id}/document/{document_id}/tags', response_model=list[KnowledgeTagModel])

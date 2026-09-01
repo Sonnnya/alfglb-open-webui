@@ -127,8 +127,16 @@ export const currentChatPage = writable(1);
 
 /**
  * Bumped whenever a knowledge base directory is created, renamed, moved or
- * deleted. The sidebar tree (Sidebar/KnowledgeFolders.svelte) refetches on every
- * change; the knowledge base screen, which owns all four mutations, bumps it.
+ * deleted — or when a DOCUMENT changes in a way the tree draws: /dirs carries each
+ * folder's pending/rejected tally, so approving, rejecting, uploading, deleting or
+ * moving a document makes a dot stale exactly as renaming a folder makes a label
+ * stale. The counter means «the sidebar tree's data is out of date», not «a folder
+ * row changed»; a second counter for the document half would be a second name for
+ * one fact. Nothing but the tree watches it, so a bump costs one /dirs fetch and
+ * triggers no page reload.
+ *
+ * The sidebar tree (Sidebar/KnowledgeFolders.svelte) refetches on every change;
+ * the knowledge base screen, which owns the mutations, bumps it.
  *
  * A counter rather than the directory list itself: the two components want
  * different shapes — the screen gets one level at a time from /documents, the
