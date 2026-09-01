@@ -1108,10 +1108,16 @@ export const deleteKnowledgeDirectory = async (
  * the documents an Эксперт most wants to file away. Same endpoint, different key.
  */
 /**
- * The whole directory tree of a knowledge base, flat, each row carrying parent_id.
+ * The whole directory tree of a knowledge base, flat, each row carrying parent_id
+ * and the pending/rejected tally of its own subtree.
  *
  * Not the same as the `directories` on getKnowledgeDocuments — that is one level
  * and only on page 1, which is right for the registry and useless for a tree.
+ *
+ * Returns `{ directories, pending_count, rejected_count }`, not a bare array: the
+ * tree's root row is the knowledge base itself and its mark needs the base-wide
+ * numbers, which no folder row carries — a document that was never filed into a
+ * folder would otherwise be invisible in the tree.
  */
 export const getKnowledgeDirectories = async (token: string, id: string) => {
 	let error = null;

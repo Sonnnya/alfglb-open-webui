@@ -7,15 +7,32 @@
 
 	import Folder from '$lib/components/icons/Folder.svelte';
 	import ChevronRight from '$lib/components/icons/ChevronRight.svelte';
+	import ReviewDots from './ReviewDots.svelte';
 	import { isKnowledgeDrag, readDirectoryDrag, readDocumentDrag } from '$lib/utils/knowledge-dnd';
 
-	type Directory = { id: string; name: string; parent_id: string | null };
+	type Directory = {
+		id: string;
+		name: string;
+		parent_id: string | null;
+		// Its whole subtree, so a collapsed folder still shows what is buried in it —
+		// the point of a marker in a tree.
+		pending_count?: number | null;
+		rejected_count?: number | null;
+	};
 
 	export let directory: Directory;
 	export let childrenOf: Record<string, Directory[]> = {};
 	export let expanded: Record<string, boolean> = {};
 	export let activeId: string | null = null;
 	export let depth = 0;
+	/**
+	 * Whether to draw the red mark as well as the yellow one. A reviewer gets only
+	 * yellow: their job is the queue of unreviewed revisions, and a rejected one is
+	 * finished business they do not need to walk back to. An Эксперт gets both, and
+	 * both count only their own documents — that is the whole signal, «the revision
+	 * you proposed came back».
+	 */
+	export let showRejected = false;
 
 	export let onOpen: (directoryId: string) => void = () => {};
 	export let onToggle: (directoryId: string) => void = () => {};
@@ -102,6 +119,12 @@
 		>
 			<Folder className="size-3.5 shrink-0 text-gray-500" />
 			<span class="truncate text-sm">{directory.name}</span>
+			<ReviewDots
+				pending={directory.pending_count}
+				rejected={showRejected ? directory.rejected_count : 0}
+				scopedToViewer={showRejected}
+				className="ml-auto pl-1"
+			/>
 		</button>
 	</div>
 
@@ -113,6 +136,7 @@
 				{expanded}
 				{activeId}
 				depth={depth + 1}
+				{showRejected}
 				{onOpen}
 				{onToggle}
 				{onDrop}

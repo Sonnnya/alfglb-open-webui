@@ -72,7 +72,9 @@
 			toast.error(`${e}`);
 			return null;
 		});
-		directories = res ?? [];
+		// The endpoint returns { directories, pending_count, rejected_count } — the
+		// counts are for the sidebar tree's dots and mean nothing in a move picker.
+		directories = res?.directories ?? [];
 		flatten();
 		loading = false;
 	};

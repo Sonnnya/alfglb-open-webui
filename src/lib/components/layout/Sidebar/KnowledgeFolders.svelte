@@ -41,24 +41,45 @@
 	import {
 		knowledgeDirectoryRevision,
 		knowledgeDocumentRevision,
-		activeKnowledgeDirectoryId
+		activeKnowledgeDirectoryId,
+		user
 	} from '$lib/stores';
 	import { isKnowledgeDrag, readDirectoryDrag, readDocumentDrag } from '$lib/utils/knowledge-dnd';
 
 	import BookOpen from '$lib/components/icons/BookOpen.svelte';
 	import ChevronRight from '$lib/components/icons/ChevronRight.svelte';
 	import KnowledgeFolderNode from './KnowledgeFolders/KnowledgeFolderNode.svelte';
+	import ReviewDots from './KnowledgeFolders/ReviewDots.svelte';
 
 	const i18n = getContext<Writable<i18nType>>('i18n');
 
 	export let knowledgeId: string;
 
-	type Directory = { id: string; name: string; parent_id: string | null };
+	type Directory = {
+		id: string;
+		name: string;
+		parent_id: string | null;
+		pending_count?: number | null;
+		rejected_count?: number | null;
+	};
 
 	let directories: Directory[] = [];
+	// Base-wide, for the root row's own mark. Not the sum of the top-level folders:
+	// a document sitting at the root of the base belongs to no folder, so summing
+	// the children would hide exactly the documents that were just uploaded and
+	// never filed — the likeliest pending ones there are.
+	let baseCounts = { pending: 0, rejected: 0 };
 	let loaded = false;
 	let open = true;
 	let expanded: Record<string, boolean> = {};
+
+	// The same expression KnowledgeBase.svelte gates its review controls on, and
+	// the same rule _may_review applies on the server, which is what scoped the
+	// numbers before they got here. A reviewer sees only yellow — the pending queue
+	// is their work; a rejected document is somebody else's move. An Эксперт sees
+	// both, over their own documents only.
+	$: canReview =
+		$user?.role === 'admin' || ($user?.permissions?.workspace?.knowledge_review ?? false);
 
 	// parent_id -> children, so each node looks its children up instead of
 	// filtering the whole list (O(n²) once a base has real depth).
@@ -83,7 +104,8 @@
 		// Deliberately silent: a sidebar section the user did not ask for should not
 		// raise a toast when it fails. It stays empty instead.
 		if (res) {
-			directories = res;
+			directories = res.directories ?? [];
+			baseCounts = { pending: res.pending_count ?? 0, rejected: res.rejected_count ?? 0 };
 		}
 		loaded = true;
 	};
@@ -110,6 +132,14 @@
 	// on the right never appears on the left until a reload, which reads as the
 	// creation having failed. Referencing the store inside the block is what makes
 	// this reactive to it.
+	//
+	// Since /dirs also carries the review counts, the counter now means «the tree's
+	// data is stale», which a document can make true as well: approving, rejecting,
+	// uploading, deleting or MOVING one changes a dot. Those paths bump it too. A
+	// second counter for them would be a second name for the same fact — and this
+	// one is watched by nothing else, so a bump costs exactly one /dirs fetch and
+	// no page reload. `expanded` and `activeId` are separate state, so nothing
+	// collapses or flickers when the rows are replaced.
 	let appliedRevision = -1;
 	$: if (loaded && $knowledgeDirectoryRevision !== appliedRevision) {
 		appliedRevision = $knowledgeDirectoryRevision;
@@ -165,6 +195,9 @@
 				// The screen on the right is what renders the document list; it has no
 				// other way to learn the row it is showing has moved.
 				knowledgeDocumentRevision.update((n) => n + 1);
+				// And the dots: the document's review state just changed folders, so
+				// two subtree counts in this very tree are now wrong.
+				knowledgeDirectoryRevision.update((n) => n + 1);
 			}
 			return;
 		}
@@ -244,8 +277,17 @@
 				<div class="self-center shrink-0">
 					<BookOpen className="size-4.5" strokeWidth="1.5" />
 				</div>
-				<div class="flex flex-1 min-w-0 self-center translate-y-[0.5px]">
+				<div class="flex flex-1 min-w-0 self-center translate-y-[0.5px] gap-1.5">
 					<div class="self-center text-sm font-primary truncate">{$i18n.t('Knowledge Base')}</div>
+					<!-- The root row is a folder like any other in this tree, so it carries
+					     the same mark — base-wide, which is also the only place a document
+					     that was never filed into a folder can show up. -->
+					<ReviewDots
+						pending={baseCounts.pending}
+						rejected={canReview ? 0 : baseCounts.rejected}
+						scopedToViewer={!canReview}
+						className="self-center"
+					/>
 				</div>
 			</button>
 
@@ -275,6 +317,7 @@
 					{expanded}
 					{activeId}
 					depth={0}
+					showRejected={!canReview}
 					onOpen={openDirectory}
 					onToggle={toggle}
 					onDrop={handleDrop}

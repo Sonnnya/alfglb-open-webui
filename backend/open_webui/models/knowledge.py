@@ -2,6 +2,7 @@ import json
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Literal, Optional
 
 from open_webui.config import RAG_FILE_CONTENT_SEARCH_MAX_CHARS
@@ -248,11 +249,29 @@ class KnowledgeDirectoryModel(BaseModel):
     updated_at: int  # timestamp in epoch
 
     # Documents in this folder AND every folder under it. None where nothing has
-    # computed it — the routes that return a bare directory row (/dirs, create,
-    # rename) do not, because they answer "what folders exist", not "how full are
-    # they". Only search_documents_by_id fills it in, after model_validate: the
-    # column does not exist on KnowledgeDirectory, so from_attributes cannot.
+    # computed it — the routes that return a bare directory row (create, rename)
+    # do not, because they answer "what folders exist", not "how full are they".
+    # search_documents_by_id fills it in, after model_validate: the column does
+    # not exist on KnowledgeDirectory, so from_attributes cannot.
+    #
+    # /dirs deliberately leaves it None while filling the two below: the sidebar
+    # tree draws a dot, never a total, and a number nothing renders is a number
+    # nobody keeps honest.
     file_count: Optional[int] = None
+
+    # How many documents in that same subtree are awaiting review or were
+    # rejected — the yellow and red the folder rows and the sidebar tree draw.
+    #
+    # SCOPED TO THE VIEWER unless they may review: an Эксперт is shown only what
+    # they themselves authored, because the point of the red dot is «the revision
+    # you proposed came back». A Мастер-эксперт or an admin gets the base-wide
+    # number, because the point of the yellow one is «this is your queue».
+    # file_count above is never scoped — a folder holds what it holds.
+    #
+    # None means "not computed", which is not the same as 0. Only the two callers
+    # that ask for counts fill these in.
+    pending_count: Optional[int] = None
+    rejected_count: Optional[int] = None
 
 
 class KnowledgeDirectoryForm(BaseModel):
@@ -353,11 +372,44 @@ class KnowledgeDocumentListResponse(BaseModel):
     breadcrumbs: list[KnowledgeDirectoryModel] = Field(default_factory=list)
 
 
+class KnowledgeDirectoryListResponse(BaseModel):
+    """GET /{id}/dirs — the sidebar tree.
+
+    An object rather than a bare list because the tree's root row is the knowledge
+    base itself, and its dot needs a number no folder carries: documents sitting
+    at the root of the base belong to no folder, so summing the top-level folders
+    would hide them.
+    """
+
+    directories: list[KnowledgeDirectoryModel] = Field(default_factory=list)
+    # Base-wide, and scoped to the viewer exactly as the per-folder counts are.
+    pending_count: int = 0
+    rejected_count: int = 0
+
+
 class KnowledgeFileListResponse(BaseModel):
     items: list[FileUserResponse]
     directories: list[KnowledgeDirectoryModel] = Field(default_factory=list)
     breadcrumbs: list[KnowledgeDirectoryModel] = Field(default_factory=list)
     total: int
+
+
+@dataclass
+class DirectoryDocumentCounts:
+    """How many documents a folder holds, split by review state.
+
+    A dataclass rather than three parallel dicts because the three numbers come
+    out of ONE grouped query and are always wanted together — splitting them
+    would mean three GROUP BYs where the registry already runs exactly one.
+
+    Used for both the *direct* (this folder only) and the *subtree* (this folder
+    and everything under it) tallies; which one you hold is decided by whoever
+    handed it to you.
+    """
+
+    total: int = 0
+    pending: int = 0
+    rejected: int = 0
 
 
 class KnowledgeTable:
@@ -957,6 +1009,7 @@ class KnowledgeTable:
         filter: Optional[dict] = None,
         skip: int = 0,
         limit: int = 30,
+        viewer_id: Optional[str] = None,
         db: Optional[AsyncSession] = None,
     ) -> KnowledgeDocumentListResponse:
         """The human-facing document registry: one row per document, latest version.
@@ -971,6 +1024,11 @@ class KnowledgeTable:
         Cardinality stays one row per document — the max(version_no) subquery is
         grouped by document and joined back on equality — so LIMIT/OFFSET and the
         total count remain correct.
+
+        ``viewer_id`` scopes only the pending/rejected counts on the folder rows,
+        never the documents themselves: an Эксперт still sees every document in a
+        folder, and the badge next to it counts the ones that are theirs to fix.
+        None gives the base-wide tally a reviewer wants.
         """
         filter = filter or {}
         async with get_async_db_context(db) as db:
@@ -1040,8 +1098,8 @@ class KnowledgeTable:
             # this listing pages through, so it means "this folder" in folder mode
             # and "hits" during a search — neither of which is the number the header
             # wants. Summing the direct counts gives the base-wide one.
-            direct_counts = await self.get_document_counts_by_directory(knowledge_id, db=db)
-            total_all = sum(direct_counts.values())
+            direct_counts = await self.get_document_counts_by_directory(knowledge_id, viewer_id=viewer_id, db=db)
+            total_all = sum(counts.total for counts in direct_counts.values())
 
             directories = (
                 await self.get_directories(knowledge_id, parent_id=directory_id, db=db)
@@ -1053,11 +1111,14 @@ class KnowledgeTable:
                 # A folder's count must include its subfolders: an Эксперт standing
                 # at the root of «ГОСТы» reads 0 next to it while forty documents sit
                 # one level down, which is what made the old number confusing.
-                subtree_counts = self.rollup_subtree_counts(
+                subtree_counts = self.rollup_subtree_status_counts(
                     await self.get_all_directories(knowledge_id, db=db), direct_counts
                 )
                 for directory in directories:
-                    directory.file_count = subtree_counts.get(directory.id, 0)
+                    counts = subtree_counts.get(directory.id, DirectoryDocumentCounts())
+                    directory.file_count = counts.total
+                    directory.pending_count = counts.pending
+                    directory.rejected_count = counts.rejected
 
             return KnowledgeDocumentListResponse(
                 # Folders ride along on the FIRST page only. They are not paginated —
@@ -1646,8 +1707,8 @@ class KnowledgeTable:
             return [KnowledgeDirectoryModel.model_validate(d) for d in result.scalars().all()]
 
     async def get_document_counts_by_directory(
-        self, knowledge_id: str, db: Optional[AsyncSession] = None
-    ) -> dict[Optional[str], int]:
+        self, knowledge_id: str, viewer_id: Optional[str] = None, db: Optional[AsyncSession] = None
+    ) -> dict[Optional[str], DirectoryDocumentCounts]:
         """How many documents sit *directly* in each folder. ``None`` is the root.
 
         Counts exactly the rows ``search_documents_by_id`` would list — same three
@@ -1655,6 +1716,18 @@ class KnowledgeTable:
         disagree with the number of rows you get after clicking it. A plain
         ``COUNT(*)`` over knowledge_file would also count documents whose file row
         has gone, which the registry skips and nobody can open.
+
+        ONE query, not three. The pending/rejected split is another column in the
+        GROUP BY, not another round trip: the registry already ran this query for
+        the header total, so the review counts on every folder row cost nothing
+        the page was not already paying.
+
+        ``viewer_id`` scopes the pending/rejected tallies to documents that person
+        authored — ``total`` is never scoped, because a folder holds what it holds.
+        Authorship is ``coalesce(latest version author, document creator)``, which
+        is exactly the «Автор» the registry row displays, so the number on a folder
+        and the rows inside it name the same person. Pass None for the base-wide
+        tally a reviewer gets.
         """
         async with get_async_db_context(db) as db:
             latest = (
@@ -1667,8 +1740,23 @@ class KnowledgeTable:
             )
             version = aliased(KnowledgeFileVersion)
 
+            # Same expression search_documents_by_id filters ?status= on: a
+            # versionless document reads as approved once it has a published file.
+            effective_status = func.coalesce(
+                version.status,
+                case((KnowledgeFile.file_id.isnot(None), VERSION_STATUS_APPROVED), else_=VERSION_STATUS_PENDING),
+            )
+
+            # Built as a list because the authorship column is only added when
+            # someone is being scoped. A constant literal in GROUP BY renders as a
+            # bind parameter, which Postgres rejects.
+            columns = [KnowledgeFile.directory_id, effective_status]
+            if viewer_id:
+                author = func.coalesce(version.author_id, KnowledgeFile.user_id)
+                columns.append(case((author == viewer_id, 1), else_=0))
+
             stmt = (
-                select(KnowledgeFile.directory_id, func.count())
+                select(*columns, func.count())
                 .outerjoin(latest, latest.c.kf_id == KnowledgeFile.id)
                 .outerjoin(
                     version,
@@ -1680,10 +1768,24 @@ class KnowledgeTable:
                 .outerjoin(File, File.id == func.coalesce(version.file_id, KnowledgeFile.file_id))
                 .filter(KnowledgeFile.knowledge_id == knowledge_id)
                 .filter(File.id.isnot(None))
-                .group_by(KnowledgeFile.directory_id)
+                .group_by(*columns)
             )
 
-            return {directory_id: count for directory_id, count in (await db.execute(stmt)).all()}
+            counts: dict[Optional[str], DirectoryDocumentCounts] = {}
+            for row in (await db.execute(stmt)).all():
+                directory_id, row_status, count = row[0], row[1], row[-1]
+                # Unscoped: every row is the viewer's business.
+                mine = bool(row[2]) if viewer_id else True
+
+                entry = counts.setdefault(directory_id, DirectoryDocumentCounts())
+                entry.total += count
+                if mine:
+                    if row_status == VERSION_STATUS_PENDING:
+                        entry.pending += count
+                    elif row_status == VERSION_STATUS_REJECTED:
+                        entry.rejected += count
+
+            return counts
 
     @staticmethod
     def rollup_subtree_counts(
@@ -1712,6 +1814,66 @@ class KnowledgeTable:
                 current = parent_of.get(current)
 
         return subtree
+
+    @classmethod
+    def rollup_subtree_status_counts(
+        cls,
+        directories: list[KnowledgeDirectoryModel],
+        direct: dict[Optional[str], DirectoryDocumentCounts],
+    ) -> dict[str, DirectoryDocumentCounts]:
+        """The same walk as ``rollup_subtree_counts``, for all three tallies.
+
+        Three passes over the folder list rather than one that carries a triple:
+        the walk is a dozen lines of parent-chasing with a cycle guard, and having
+        one implementation of it means the totals and the review counts can never
+        roll up differently. A base holds tens of folders; this is free.
+        """
+        totals = cls.rollup_subtree_counts(directories, {k: v.total for k, v in direct.items()})
+        pending = cls.rollup_subtree_counts(directories, {k: v.pending for k, v in direct.items()})
+        rejected = cls.rollup_subtree_counts(directories, {k: v.rejected for k, v in direct.items()})
+
+        return {
+            directory.id: DirectoryDocumentCounts(
+                total=totals.get(directory.id, 0),
+                pending=pending.get(directory.id, 0),
+                rejected=rejected.get(directory.id, 0),
+            )
+            for directory in directories
+        }
+
+    async def get_all_directories_with_review_counts(
+        self,
+        knowledge_id: str,
+        viewer_id: Optional[str] = None,
+        db: Optional[AsyncSession] = None,
+    ) -> tuple[list[KnowledgeDirectoryModel], DirectoryDocumentCounts]:
+        """The sidebar tree: every folder, each carrying its subtree review counts,
+        plus the base-wide tally for the tree's root row.
+
+        The base-wide number is NOT the sum of the top-level folders. Documents
+        sitting at the root of the base belong to no folder at all, so summing the
+        children would leave a pending document invisible in the tree — which is
+        the one thing the dots exist to prevent.
+
+        ``file_count`` is deliberately left None: the tree draws a dot, never a
+        total, and a number nothing renders is a number nobody keeps honest.
+        """
+        async with get_async_db_context(db) as db:
+            directories = await self.get_all_directories(knowledge_id, db=db)
+            direct = await self.get_document_counts_by_directory(knowledge_id, viewer_id=viewer_id, db=db)
+            subtree = self.rollup_subtree_status_counts(directories, direct)
+
+            for directory in directories:
+                counts = subtree.get(directory.id, DirectoryDocumentCounts())
+                directory.pending_count = counts.pending
+                directory.rejected_count = counts.rejected
+
+            base = DirectoryDocumentCounts(
+                total=sum(c.total for c in direct.values()),
+                pending=sum(c.pending for c in direct.values()),
+                rejected=sum(c.rejected for c in direct.values()),
+            )
+            return directories, base
 
     async def get_all_directories(
         self,
