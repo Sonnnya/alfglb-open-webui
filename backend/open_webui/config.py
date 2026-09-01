@@ -1100,6 +1100,23 @@ RAG_EMBEDDING_ENGINE = os.getenv('RAG_EMBEDDING_ENGINE', '')
 
 PDF_EXTRACT_IMAGES = os.getenv('PDF_EXTRACT_IMAGES', 'False').lower() == 'true'
 
+# Native per-page OCR fallback for scanned PDFs (retrieval/loaders/ocr.py).
+# Unrelated to PDF_EXTRACT_IMAGES above, which is upstream's broken
+# per-XObject path - do not merge the two.
+PDF_OCR_ENABLE = os.getenv('PDF_OCR_ENABLE', 'True').lower() == 'true'
+# A page whose text layer is shorter than this is treated as scanned.
+PDF_OCR_TEXT_THRESHOLD = int(os.getenv('PDF_OCR_TEXT_THRESHOLD', '100'))
+# 300 DPI measured best: 200 lost whole lines, 400 gained nothing and cost 60% more time.
+PDF_OCR_DPI = int(os.getenv('PDF_OCR_DPI', '300'))
+# Cyrillic recognition model. The bundled RapidOCR model is Chinese/English and
+# holds 6 Cyrillic characters, so it cannot read this corpus at all.
+# Swapping this means swapping PDF_OCR_KEYS_PATH for the matching dict.
+PDF_OCR_REC_MODEL_URL = os.getenv(
+    'PDF_OCR_REC_MODEL_URL',
+    'https://huggingface.co/PaddlePaddle/cyrillic_PP-OCRv5_mobile_rec_onnx/resolve/main/inference.onnx',
+)
+PDF_OCR_KEYS_PATH = os.getenv('PDF_OCR_KEYS_PATH', '')
+
 PDF_LOADER_MODE = os.getenv('PDF_LOADER_MODE', 'page')
 
 RAG_EMBEDDING_MODEL = os.getenv('RAG_EMBEDDING_MODEL', 'sentence-transformers/all-MiniLM-L6-v2')
@@ -2975,6 +2992,11 @@ DEFAULT_CONFIG = {
     'rag.file.allowed_extensions': RAG_ALLOWED_FILE_EXTENSIONS,
     'rag.embedding_engine': RAG_EMBEDDING_ENGINE,
     'rag.pdf_extract_images': PDF_EXTRACT_IMAGES,
+    'rag.pdf_ocr_enable': PDF_OCR_ENABLE,
+    'rag.pdf_ocr_text_threshold': PDF_OCR_TEXT_THRESHOLD,
+    'rag.pdf_ocr_dpi': PDF_OCR_DPI,
+    'rag.pdf_ocr_rec_model_url': PDF_OCR_REC_MODEL_URL,
+    'rag.pdf_ocr_keys_path': PDF_OCR_KEYS_PATH,
     'rag.pdf_loader_mode': PDF_LOADER_MODE,
     'rag.embedding_model': RAG_EMBEDDING_MODEL,
     'rag.tokenizer_model': RAG_TOKENIZER_MODEL,

@@ -21,12 +21,14 @@ from open_webui.env import (
     AIOHTTP_CLIENT_SESSION_SSL,
     GLOBAL_LOG_LEVEL,
     MINERU_MAX_MARKDOWN_BYTES,
+    OCR_MODEL_DIR,
     REQUESTS_VERIFY,
 )
 from open_webui.retrieval.loaders.datalab_marker import DatalabMarkerLoader
 from open_webui.retrieval.loaders.external_document import ExternalDocumentLoader
 from open_webui.retrieval.loaders.mineru import MinerULoader
 from open_webui.retrieval.loaders.mistral import MistralLoader
+from open_webui.retrieval.loaders.ocr import PDFOCRLoader
 from open_webui.retrieval.loaders.paddleocr_vl import PaddleOCRVLLoader
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
@@ -408,6 +410,35 @@ class Loader:
 
         return (cjk_count / total) >= threshold
 
+    def _get_pdf_loader(self, file_path: str):
+        """Pick the PDF loader: OCR-capable by default, upstream's on request.
+
+        `PDF_EXTRACT_IMAGES` is deliberately not consulted on the OCR path. It
+        selects upstream's per-XObject extraction, which crashes outright on the
+        scanned documents in this corpus and, when it does not, OCRs the wrong
+        thing - see `loaders/ocr.py` for the measurements.
+        """
+        ocr_enabled = self.kwargs.get('PDF_OCR_ENABLE')
+        if ocr_enabled is None:
+            ocr_enabled = True
+
+        if not ocr_enabled:
+            return PyPDFLoader(
+                file_path,
+                extract_images=self.kwargs.get('PDF_EXTRACT_IMAGES'),
+                mode=self.kwargs.get('PDF_LOADER_MODE', 'page'),
+            )
+
+        return PDFOCRLoader(
+            file_path,
+            dpi=self.kwargs.get('PDF_OCR_DPI') or 300,
+            text_threshold=self.kwargs.get('PDF_OCR_TEXT_THRESHOLD') or 100,
+            model_dir=str(OCR_MODEL_DIR),
+            model_url=self.kwargs.get('PDF_OCR_REC_MODEL_URL') or '',
+            keys_path=self.kwargs.get('PDF_OCR_KEYS_PATH') or '',
+            mode=self.kwargs.get('PDF_LOADER_MODE', 'page'),
+        )
+
     def _get_loader(self, filename: str, file_content_type: str, file_path: str):
         file_ext = filename.split('.')[-1].lower()
 
@@ -563,11 +594,7 @@ class Loader:
             )
         else:
             if file_ext == 'pdf':
-                loader = PyPDFLoader(
-                    file_path,
-                    extract_images=self.kwargs.get('PDF_EXTRACT_IMAGES'),
-                    mode=self.kwargs.get('PDF_LOADER_MODE', 'page'),
-                )
+                loader = self._get_pdf_loader(file_path)
             elif file_ext == 'csv':
                 loader = CSVLoader(file_path, encoding=self._detect_text_encoding(file_path))
             elif file_ext == 'rst':
