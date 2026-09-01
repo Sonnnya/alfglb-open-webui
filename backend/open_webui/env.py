@@ -241,6 +241,10 @@ STATIC_DIR = Path(os.getenv('STATIC_DIR', OPEN_WEBUI_DIR / 'static'))
 
 FONTS_DIR = Path(os.getenv('FONTS_DIR', OPEN_WEBUI_DIR / 'static' / 'fonts'))
 
+# Cache for OCR models downloaded on first use (see retrieval/loaders/ocr.py).
+# Under DATA_DIR so it survives an image rebuild on the mounted volume.
+OCR_MODEL_DIR = Path(os.getenv('OCR_MODEL_DIR', DATA_DIR / 'ocr'))
+
 FRONTEND_BUILD_DIR = Path(os.getenv('FRONTEND_BUILD_DIR', BASE_DIR / 'build')).resolve()
 
 if FROM_INIT_PY:
