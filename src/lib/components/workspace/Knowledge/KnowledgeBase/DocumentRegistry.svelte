@@ -82,6 +82,14 @@
 	export let directoryId: string | null = null;
 	/** Whether the viewer may create, rename, move or delete folders. */
 	export let writeAccess = false;
+	/**
+	 * Whether the viewer may change the folder tree — create, rename, move,
+	 * delete. Administrators only, and deliberately a second prop rather than a
+	 * rename of `writeAccess`: an Эксперт keeps every document right that one
+	 * carries (upload, drag a document into a folder, move their own), and only
+	 * loses the folders themselves.
+	 */
+	export let manageFolders = false;
 
 	export let onNavigate: (directoryId: string | null) => void = () => {};
 	export let onRenameDirectory: (directoryId: string, name: string) => void = () => {};
@@ -548,7 +556,7 @@
 				<div class="w-full border-b border-gray-50 dark:border-gray-850 py-2">
 					<DirectoryRow
 						{directory}
-						{writeAccess}
+						{manageFolders}
 						scopedToViewer={!canReview}
 						onNavigate={(dirId) => onNavigate(dirId)}
 						onRename={(dirId, name) => onRenameDirectory(dirId, name)}

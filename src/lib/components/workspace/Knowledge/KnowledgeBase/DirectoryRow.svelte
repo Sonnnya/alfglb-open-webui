@@ -38,7 +38,13 @@
 		pending_count?: number | null;
 		rejected_count?: number | null;
 	};
-	export let writeAccess = false;
+	/**
+	 * Whether the viewer may change the folder tree — rename, move, delete.
+	 * Administrators only (row 7 of the role matrix), which is NOT the same as
+	 * write access to the base: an Эксперт still uploads documents and still
+	 * drags them INTO folders, so the drop handlers below stay ungated.
+	 */
+	export let manageFolders = false;
 	/**
 	 * Whether the two counts above are the viewer's OWN documents rather than the
 	 * whole folder's. The backend decides it — _may_review there, canReview here —
@@ -87,12 +93,16 @@
 		{dragOver
 		? 'bg-gray-100 dark:bg-gray-800 ring-1 ring-gray-300 dark:ring-gray-600'
 		: 'hover:bg-gray-100 dark:hover:bg-gray-850'}"
-	draggable="true"
+	draggable={manageFolders}
 	on:dragstart={(e) => {
+		// The only place a folder drag starts, so gating it here is what stops a
+		// non-admin moving a folder onto a row, a breadcrumb or the sidebar tree —
+		// three drop targets, one source.
+		if (!manageFolders) return;
 		setDirectoryDrag(e.dataTransfer, directory.id);
 	}}
 	on:dblclick={() => {
-		if (writeAccess) startRename();
+		if (manageFolders) startRename();
 	}}
 	on:dragover={(e) => {
 		if (!isKnowledgeDrag(e.dataTransfer)) return;
@@ -227,7 +237,7 @@
 		</div>
 	</button>
 
-	{#if writeAccess}
+	{#if manageFolders}
 		<div class="flex items-center">
 			<Dropdown bind:show={showDropdown} align="end" sideOffset={4}>
 				<button

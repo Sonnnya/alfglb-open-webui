@@ -2409,9 +2409,20 @@ async def create_knowledge_directory(
     request: Request,
     id: str,
     form_data: KnowledgeDirectoryCreateForm,
-    user=Depends(get_verified_user),
+    user=Depends(get_admin_user),
     db: AsyncSession = Depends(get_async_session),
 ):
+    """Create a folder. **Admin only** — row 7 of the role matrix.
+
+    Creating, renaming, moving and deleting folders are one right, held by nobody
+    but an administrator: the tree is the shape of the corpus, and an Эксперт
+    reorganising it moves everyone else's documents without touching them.
+    Reading the tree is a different question — GET /{id}/dirs stays on
+    _load_kb_for, because both tiers have to see where their documents live.
+
+    The write-grant test below is now unreachable, as an admin satisfies it by
+    definition; kept as the second lock, same as /reset.
+    """
     await _verify_knowledge_write_access(id, user, db)
 
     directory = await Knowledges.create_directory(
@@ -2442,9 +2453,14 @@ async def update_knowledge_directory(
     id: str,
     dir_id: str,
     form_data: KnowledgeDirectoryUpdateForm,
-    user=Depends(get_verified_user),
+    user=Depends(get_admin_user),
     db: AsyncSession = Depends(get_async_session),
 ):
+    """Rename a folder, move it, or both. **Admin only** — see /dirs/create.
+
+    One route for two operations: the form carries `name` and `parent_id`, so
+    dragging a folder somewhere else comes through here too.
+    """
     await _verify_knowledge_write_access(id, user, db)
 
     # Verify directory belongs to this knowledge base
@@ -2482,9 +2498,16 @@ async def delete_knowledge_directory(
     id: str,
     dir_id: str,
     move_files: bool = Query(True, description='If true, move contained files to parent. If false, delete them.'),
-    user=Depends(get_verified_user),
+    user=Depends(get_admin_user),
     db: AsyncSession = Depends(get_async_session),
 ):
+    """Delete a folder, optionally with everything under it. **Admin only** — see /dirs/create.
+
+    The per-document ownership pass below is now redundant for the same reason the
+    write-grant test is: only an admin reaches it, and an admin may purge anyone's
+    work. It stays because it is the thing that makes a mixed-ownership subtree
+    delete all-or-nothing, and that property should not depend on who is asking.
+    """
     knowledge = await _verify_knowledge_write_access(id, user, db)
 
     # Verify directory belongs to this knowledge base

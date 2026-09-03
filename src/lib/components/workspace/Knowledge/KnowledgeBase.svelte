@@ -65,6 +65,14 @@
 	// re-checks the same key, so this only hides buttons.
 	$: canReviewVersions =
 		$user?.role === 'admin' || ($user?.permissions?.workspace?.knowledge_review ?? false);
+
+	// The folder tree is the shape of the corpus, so changing it is an
+	// administrator's job (row 7 of the role matrix) — not a Мастер-эксперт's, and
+	// not something write access carries. Deliberately the bare role and not a
+	// permission key: no group grants this, and inventing one would suggest a tier
+	// could be given it. Kept apart from `write_access`, which still means "may add
+	// and file documents" and still belongs to both tiers.
+	$: mayManageFolders = $user?.role === 'admin';
 	import AddFilesPlaceholder from '$lib/components/AddFilesPlaceholder.svelte';
 
 	import AddContentMenu from './KnowledgeBase/AddContentMenu.svelte';
@@ -1865,38 +1873,31 @@
 
 							<!-- Secondary to «Загрузить новый документ» on purpose: uploading is
 							     the everyday action, foldering is occasional. It creates the folder
-							     inside whichever one is open, so the button follows the breadcrumb. -->
-							<button
-								class="px-3 py-1.5 rounded-xl border border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-850 transition font-medium text-sm flex items-center gap-1.5 shrink-0"
-								type="button"
-								on:click={() => {
-									showNewDirectoryModal = true;
-								}}
-							>
-								<NewFolderAlt className="size-4" />
-								{$i18n.t('Create folder')}
-							</button>
+							     inside whichever one is open, so the button follows the breadcrumb.
 
-							<!-- Admin-only, and cosmetically so — like every other gate in this
-							     tree. It drives the pre-existing uploadDirectoryHandler(), which
-							     reaches POST /{id}/dirs/create (gated by
-							     _verify_knowledge_write_access) and POST /files/ (whose
-							     knowledge auto-link gates on the same write grant), so an
-							     Эксперт could still do all of this over HTTP. The restriction is
-							     about who should be reshaping the folder tree wholesale, not
-							     about what the server will accept.
+							     Admin-only, like every other folder control: /dirs/create refuses
+							     anyone else, so drawing it for an Эксперт would offer a button that
+							     can only fail. Uploading a folder is already admin-only next to it,
+							     and for the same reason. -->
+							{#if mayManageFolders}
+								<button
+									class="px-3 py-1.5 rounded-xl border border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-850 transition font-medium text-sm flex items-center gap-1.5 shrink-0"
+									type="button"
+									on:click={() => {
+										showNewDirectoryModal = true;
+									}}
+								>
+									<NewFolderAlt className="size-4" />
+									{$i18n.t('Create folder')}
+								</button>
+							{/if}
 
-							     The picked folder is RECREATED inside the open one, with its
-							     subtree under it — it is not unpacked. Uploading «ГОСТы» while
-							     standing in the root gives you «ГОСТы», which is what the drop
-							     handler has always done and what an admin mirroring a local
-							     tree expects.
-
-							     Empty folders included — the picker reports them and they are
-							     sent alongside the files, because the server derives folders
-							     from file paths alone and cannot see one that holds nothing.
-							     The exception is the webkitdirectory fallback (Firefox, and any
-							     insecure context), which reports files only. -->
+							<!-- Admin-only, and now enforced: uploadDirectoryHandler() reaches
+							     POST /{id}/dirs/create, which takes get_admin_user since the role
+							     matrix put the folder tree in an administrator's hands. The
+							     documents it uploads still go through POST /files/ on a write
+							     grant, so the *files* half of this remains open to both tiers —
+							     it is the tree, not the upload, that is restricted. -->
 							{#if $user?.role === 'admin'}
 								<button
 									class="px-3 py-1.5 rounded-xl border border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-850 transition font-medium text-sm flex items-center gap-1.5 shrink-0 disabled:opacity-50"
@@ -2030,6 +2031,7 @@
 												canReview={canReviewVersions}
 												canUpload={knowledge?.write_access ?? false}
 												writeAccess={knowledge?.write_access ?? false}
+												manageFolders={mayManageFolders}
 												directoryId={currentDirectoryId}
 												{query}
 												uploading={uploadingItems}
