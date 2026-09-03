@@ -107,6 +107,11 @@
 	// runs race on createMissingDirectories: both read the same directory_map, both
 	// try to create the same folders, and the loser's /dirs/create hits the
 	// (knowledge_id, parent_id, name) constraint and aborts its whole upload.
+	//
+	// Owned by uploadDirectoryHandler, which releases it as soon as the picker
+	// settles — see the comment there. It must never be held across the upload:
+	// the button is `disabled` on it, so a single non-returning path (the
+	// webkitdirectory fallback's cancel used to be one) bricks it until a reload.
 	let pickingDirectory = false;
 	let showAccessControlModal = false;
 	let showResetConfirm = false;
@@ -164,10 +169,24 @@
 	// screen whenever the two disagreed.
 	let documentsTotal: number | null = null;
 
-	// Files still uploading, handed to the registry so it can show a row with a
-	// spinner. Two sources already feed fileItems with status 'uploading': the
-	// optimistic placeholder uploadFileHandler prepends, and the /files/pending
-	// merge in getItemsPage (embedding still running). Both belong here.
+	// What THIS tab is uploading right now. Deliberately not rendered as a list
+	// row and deliberately not in fileItems: an upload in progress is announced in
+	// exactly one place, the `syncing` banner above the list (see
+	// uploadFilesHandler), which is what the folder upload has always done. It used
+	// to be both — a banner AND a spinner row — and the two could disagree.
+	//
+	// Still tracked, because the /files/pending merge below has to subtract it: the
+	// server reports our own in-flight file as pending, so without this the same
+	// upload is announced twice. Owned by uploadFileHandler alone, which removes
+	// each entry in a `finally` so a thrown upload cannot strand one.
+	let queuedUploads: any[] = [];
+
+	// Files the SERVER says are still being processed and that this tab is NOT
+	// uploading itself — an upload whose page was reloaded, another session's, or
+	// an orphan left behind by a worker that died mid-processing. Those get a
+	// spinner row in the registry, because nothing else on the screen accounts for
+	// them. Plus uploadWeb's own placeholders, which still live in fileItems
+	// because that path is unreachable here and was left as upstream wrote it.
 	$: uploadingItems = (fileItems ?? []).filter((item) => item?.status === 'uploading');
 
 	// Directory state
@@ -266,8 +285,15 @@
 				const pendingFiles = await getPendingKnowledgeFiles(localStorage.token, knowledgeId);
 				if (pendingFiles && pendingFiles.length > 0) {
 					const existingIds = new Set(fileItems.map((f) => f.id));
+					// Anything this tab is uploading is already on the banner, and the
+					// server calls it pending until processing finishes — so without this
+					// a refresh landing mid-batch draws a row for a file the banner is
+					// counting. Matched on name+size because the placeholder never learns
+					// the file id: uploadFile() only resolves once the upload is over.
+					const queued = new Set(queuedUploads.map((f) => `${f.name} ${f.size}`));
 					const newPending = pendingFiles
 						.filter((f) => !existingIds.has(f.id))
+						.filter((f) => !queued.has(`${f.meta?.name ?? f.filename} ${f.meta?.size}`))
 						.map((f) => ({
 							...f,
 							name: f.meta?.name ?? f.filename,
@@ -432,6 +458,15 @@
 		}
 	};
 
+	// Uploads ONE file and reports whether it landed. Deliberately silent on
+	// success and deliberately does not refresh — uploadFilesHandler below owns
+	// the finish, and is the only caller. Announcing per file is what made a
+	// multi-file pick misbehave: init() sets fileItems to null, so the registry
+	// unmounted and remounted after every file, and it raced the next file's POST
+	// — by the time getItemsPage() reached /files/pending that file already
+	// existed server-side as `pending`, so the merge drew a second row for an
+	// upload already being reported. Failures still speak up per file: «готово» is
+	// one event, «этот файл не загрузился» is not.
 	const uploadFileHandler = async (file) => {
 		console.log(file);
 
@@ -449,7 +484,7 @@
 
 		if (fileItem.size == 0) {
 			toast.error($i18n.t('You cannot upload an empty file.'));
-			return null;
+			return false;
 		}
 
 		if (
@@ -465,10 +500,10 @@
 					maxSize: $config?.file?.max_size
 				})
 			);
-			return;
+			return false;
 		}
 
-		fileItems = [fileItem, ...(fileItems ?? [])];
+		queuedUploads = [...queuedUploads, fileItem];
 		try {
 			let metadata = {
 				knowledge_id: knowledge.id,
@@ -489,31 +524,96 @@
 
 			if (uploadedFile) {
 				console.log(uploadedFile);
-				fileItems = fileItems.map((item) => {
-					if (item.itemId === fileItem.itemId) {
-						item.id = uploadedFile.id;
-					}
-					return item;
-				});
 
 				if (uploadedFile.error) {
 					console.warn('File upload warning:', uploadedFile.error);
 					toast.warning(uploadedFile.error);
-					fileItems = fileItems.filter((file) => file.id !== uploadedFile.id);
-				} else {
-					toast.success($i18n.t('File added successfully.'));
-					init();
+					return false;
 				}
-			} else {
-				toast.error($i18n.t('Failed to upload file.'));
+
+				return true;
 			}
+
+			toast.error($i18n.t('Failed to upload file.'));
+			return false;
 		} catch (e) {
 			toast.error(`${e}`);
+			return false;
+		} finally {
+			// Every exit clears the entry, including the throwing ones — otherwise a
+			// failed upload keeps suppressing its own /files/pending row forever.
+			queuedUploads = queuedUploads.filter((item) => item.itemId !== fileItem.itemId);
+		}
+	};
+
+	// The one entry point for uploading picked files, and the only place that
+	// draws progress for them: one banner, one refresh, one success toast, however
+	// many files were picked. It is deliberately shaped like uploadDirectoryEntries
+	// — «Загрузить файлы» and «Загрузить папку» should not report the same work in
+	// two different ways.
+	const uploadFilesHandler = async (files: File[]) => {
+		if (!files.length) return;
+
+		let succeeded = 0;
+		try {
+			let current = 0;
+			for (const file of files) {
+				// Uploads are sequential — uploadFile() blocks on
+				// /files/{id}/process/status — and one scanned PDF can hold the loop for
+				// minutes, so the count is the only thing that says the batch is moving.
+				// A single file gets its name without «1/1», which nobody needs.
+				current++;
+				syncing =
+					files.length > 1
+						? $i18n.t('Uploading {{current}}/{{total}}: {{file}}', {
+								current,
+								total: files.length,
+								file: file.name
+							})
+						: $i18n.t('Uploading {{file}}', { file: file.name });
+
+				if (await uploadFileHandler(file)) {
+					succeeded++;
+				}
+			}
+		} finally {
+			// uploadFileHandler swallows its own errors, but the banner disables
+			// «Загрузить папку» — leaving it set would strand that button until a
+			// reload, which is the bug this screen already had once.
+			syncing = null;
+		}
+
+		if (succeeded > 0) {
+			toast.success($i18n.t('File added successfully.'));
+			init();
 		}
 	};
 
 	const uploadDirectoryHandler = async () => {
-		const scan = await collectDirectoryFiles();
+		// The flag lives here rather than in the click handler so that EVERY caller
+		// gets the guard (AddContentMenu's «Загрузить директорию» entry had none),
+		// and so that it is released the moment the picker settles instead of being
+		// held across the upload as well. `syncing` covers the upload, and
+		// uploadDirectoryEntries sets it in the same tick it starts — before its
+		// first await — so there is no window in which the button goes live.
+		// Holding one flag across both meant any path that failed to return left
+		// the button dead until a page reload.
+		if (pickingDirectory) {
+			// The toolbar button is `disabled` on this flag so it cannot get here,
+			// but AddContentMenu's «Загрузить директорию» entry is not — a silent
+			// no-op there would look like a broken button.
+			toast.info($i18n.t('A folder is already being selected.'));
+			return;
+		}
+		pickingDirectory = true;
+
+		let scan: DirectoryScan | null = null;
+		try {
+			scan = await collectDirectoryFiles();
+		} finally {
+			pickingDirectory = false;
+		}
+
 		// Folders on their own are a legitimate upload — recreating an empty tree
 		// to file documents into afterwards is the main reason this button exists.
 		if (scan?.files.length || scan?.directories.length) {
@@ -528,12 +628,16 @@
 
 	// Error handler
 	const handleUploadError = (error) => {
+		// Closing the picker is an AbortError, and it is deliberately silent: the
+		// user just cancelled, they know they cancelled, and the toast said so from
+		// the corner of the screen long after the gesture was over. Only a real
+		// failure to read the folder is worth interrupting for.
 		if (error.name === 'AbortError') {
-			toast.info($i18n.t('Directory selection was cancelled'));
-		} else {
-			toast.error($i18n.t('Error accessing directory'));
-			console.error('Directory access error:', error);
+			return;
 		}
+
+		toast.error($i18n.t('Error accessing directory'));
+		console.error('Directory access error:', error);
 	};
 
 	// Collect files from a directory without uploading.
@@ -544,7 +648,11 @@
 			if (isFileSystemAccessSupported) {
 				const dirHandle = await window.showDirectoryPicker();
 				const files: DirectoryFileEntry[] = [];
-				const directories: string[] = [];
+				// Seeded with the picked folder itself. `traverse` only pushes the
+				// folders it walks INTO, so without this an empty picked folder —
+				// or one holding nothing but files — would never be created, and
+				// its documents would land in the open folder instead.
+				const directories: string[] = [dirHandle.name];
 
 				async function traverse(handle: FileSystemDirectoryHandle, dirPath = '') {
 					for await (const entry of handle.values()) {
@@ -562,14 +670,22 @@
 					}
 				}
 
-				// '' rather than dirHandle.name: the folder you pick is the one whose
-				// CONTENTS are being uploaded, not a folder to recreate inside the base.
-				// There is no multi-directory picker on the web, so picking the parent
-				// and dropping it is how you upload several folders at once.
-				await traverse(dirHandle, '');
+				// dirHandle.name, not '': the picked folder is RECREATED inside the
+				// base, so uploading «ГОСТы» produces «ГОСТы» with its subtree under
+				// it rather than spilling fifty loose documents into whichever folder
+				// happens to be open. It is also what drag-and-drop already does
+				// (collectDroppedEntryFiles defaults entryPath to entry.name), so the
+				// two ways of adding the same folder now agree.
+				//
+				// There is no multi-directory picker on the web: uploading several
+				// sibling folders at once means picking their parent, which now
+				// arrives as a folder of its own. Drop them instead to avoid it.
+				await traverse(dirHandle, dirHandle.name);
 				return { files, directories };
 			} else {
-				// Firefox fallback
+				// Fallback for anything without showDirectoryPicker: Firefox, and any
+				// INSECURE context — the API is secure-context-only, so a stage served
+				// over plain HTTP takes this branch too. It is not the exotic path.
 				return new Promise((resolve, reject) => {
 					const input = document.createElement('input');
 					input.type = 'file';
@@ -578,6 +694,32 @@
 					input.multiple = true;
 					input.style.display = 'none';
 					document.body.appendChild(input);
+
+					// `onchange` does not fire when the dialog is dismissed, so without
+					// this the promise never settles: uploadDirectoryHandler never
+					// returns, `pickingDirectory` is never cleared, and the button stays
+					// disabled until a reload. `oncancel` covers current browsers; the
+					// window-focus listener covers the older ones that fire neither.
+					let settled = false;
+					const finish = (value: DirectoryScan | null) => {
+						if (settled) return;
+						settled = true;
+						window.removeEventListener('focus', onWindowFocus);
+						input.remove();
+						resolve(value);
+					};
+					const onWindowFocus = () => {
+						// The dialog is modal, so focus returns to the window only once it
+						// has closed. A pick fires `change` after this, hence the tick.
+						// Generous, because losing this race is worse than waiting: if
+						// `change` arrives after the check, finish(null) wins and a real
+						// pick is silently discarded.
+						setTimeout(() => {
+							if (!input.files?.length) finish(null);
+						}, 500);
+					};
+					window.addEventListener('focus', onWindowFocus);
+					input.oncancel = () => finish(null);
 
 					input.onchange = () => {
 						try {
@@ -588,26 +730,31 @@
 							const collected = files.map((file) => {
 								const parts = file.webkitRelativePath.split('/');
 								const filename = parts.pop() || file.name;
-								// slice(1) drops the picked folder's own name, which
-								// webkitRelativePath always prefixes — same rule as the
+								// The full chain, picked folder included — webkitRelativePath
+								// always prefixes it, and keeping it is the same rule as the
 								// showDirectoryPicker branch above.
-								const path = parts.slice(1).join('/');
+								const path = parts.join('/');
 								return { path, filename, file };
 							});
 
-							document.body.removeChild(input);
 							// No `directories`: a webkitdirectory input reports FILES only,
 							// so an empty folder does not exist as far as this branch is
-							// concerned. Folders implied by file paths still get created.
-							resolve({ files: collected, directories: [] });
+							// concerned. Folders implied by file paths still get created —
+							// which now includes the picked one, since every path starts
+							// with it.
+							finish({ files: collected, directories: [] });
 						} catch (error) {
-							document.body.removeChild(input);
+							settled = true;
+							window.removeEventListener('focus', onWindowFocus);
+							input.remove();
 							reject(error);
 						}
 					};
 
 					input.onerror = (error) => {
-						document.body.removeChild(input);
+						settled = true;
+						window.removeEventListener('focus', onWindowFocus);
+						input.remove();
 						reject(error);
 					};
 
@@ -765,6 +912,16 @@
 	};
 
 	// Incremental sync: hash locally → diff on server → upload only what changed
+	//
+	// UNREACHABLE — the only caller is AddContentMenu's «Синхронизировать папку»
+	// entry, and that menu never opens. Read this before reviving it: unlike
+	// uploadDirectoryEntries, it sends `entry.path` RAW, with no
+	// getDirectoryUploadPath(), and indexes directoryIdByPath on the same raw
+	// value. Since collectDirectoryFiles started keeping the picked folder's own
+	// name, those paths are one level deeper than they were, so mkdir/deleted/
+	// rmdir all shift — and this is the one function on this screen that
+	// DESTROYS data (syncKnowledgeCleanup deletes files and directories). Left
+	// untouched rather than fixed blind, because nothing can exercise it.
 	const syncDirectoryHandler = async () => {
 		if (!pendingSyncFiles?.length) return;
 
@@ -1243,12 +1400,22 @@
 				if (inputItems && inputItems.length > 0) {
 					const directoryEntries: DirectoryFileEntry[] = [];
 					const looseFiles: File[] = [];
+					// Dropping is the only gesture that can carry files and folders at
+					// once, so it is also the only place the admin-only folder rule can
+					// be sidestepped. Same gate as «Загрузить папку», applied per item:
+					// the loose files in the same drop still upload.
+					const mayUploadDirectories = $user?.role === 'admin';
+					let refusedDirectory = false;
 
 					for (const rawItem of Array.from(inputItems)) {
 						const item = rawItem as DataTransferItem & { webkitGetAsEntry?: () => any };
 						const entry = item.webkitGetAsEntry?.();
 
 						if (entry?.isDirectory) {
+							if (!mayUploadDirectories) {
+								refusedDirectory = true;
+								continue;
+							}
 							directoryEntries.push(...(await collectDroppedEntryFiles(entry)));
 						} else {
 							const file = item.getAsFile();
@@ -1258,9 +1425,11 @@
 						}
 					}
 
-					for (const file of looseFiles) {
-						await uploadFileHandler(file);
+					if (refusedDirectory) {
+						toast.error($i18n.t('Only admins can upload folders.'));
 					}
+
+					await uploadFilesHandler(looseFiles);
 
 					if (directoryEntries.length > 0) {
 						await uploadDirectoryEntries(directoryEntries);
@@ -1389,7 +1558,7 @@
 	bind:show={showAddTextContentModal}
 	on:submit={(e) => {
 		const file = createFileFromText(e.detail.name, e.detail.content);
-		uploadFileHandler(file);
+		uploadFilesHandler([file]);
 	}}
 />
 
@@ -1400,26 +1569,40 @@
 	}}
 />
 
-<!-- Single-file on purpose: one knowledge document is one file, and the picker is
-     now reached straight from «Загрузить новый документ». Dropping several files
-     still works and still makes one document each — the loop below is unchanged. -->
+<!-- `multiple`, and the button is «Загрузить файлы» to match. One knowledge
+     document is still one file — the loop below makes one per pick, exactly as
+     dropping several always has. `multiple` and `webkitdirectory` are mutually
+     exclusive on one input (the latter turns the dialog into a folder chooser and
+     the former stops meaning anything), which is why folders need the separate
+     button and why no browser can offer a dialog that takes both. Dropping is the
+     only mixed gesture, and onDrop already handles it.
+
+     Sequential on purpose: uploadFile blocks on /files/{id}/process/status, so
+     the files finish one at a time and a ten-file pick would otherwise look
+     exactly like a one-file pick that had stalled. uploadFilesHandler is what
+     reports it — one banner, the same one the folder upload draws. -->
 <input
 	id="files-input"
 	bind:files={inputFiles}
 	type="file"
+	multiple
 	hidden
 	on:change={async () => {
 		if (inputFiles && inputFiles.length > 0) {
-			for (const file of inputFiles) {
-				await uploadFileHandler(file);
-			}
+			// Copied off the FileList and the input cleared UP FRONT: the loop below
+			// can run for minutes, and until the input is reset picking the same
+			// files again fires no `change` event at all. The File objects stay valid
+			// after the reset.
+			const picked = Array.from(inputFiles) as File[];
 
 			inputFiles = null;
 			const fileInputElement = document.getElementById('files-input');
 
 			if (fileInputElement) {
-				fileInputElement.value = '';
+				(fileInputElement as HTMLInputElement).value = '';
 			}
+
+			await uploadFilesHandler(picked);
 		} else {
 			toast.error($i18n.t(`File not found.`));
 		}
@@ -1703,23 +1886,34 @@
 							     about who should be reshaping the folder tree wholesale, not
 							     about what the server will accept.
 
+							     The picked folder is RECREATED inside the open one, with its
+							     subtree under it — it is not unpacked. Uploading «ГОСТы» while
+							     standing in the root gives you «ГОСТы», which is what the drop
+							     handler has always done and what an admin mirroring a local
+							     tree expects.
+
 							     Empty folders included — the picker reports them and they are
 							     sent alongside the files, because the server derives folders
 							     from file paths alone and cannot see one that holds nothing.
-							     The exception is Firefox, whose webkitdirectory fallback
-							     reports files only. -->
+							     The exception is the webkitdirectory fallback (Firefox, and any
+							     insecure context), which reports files only. -->
 							{#if $user?.role === 'admin'}
 								<button
 									class="px-3 py-1.5 rounded-xl border border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-850 transition font-medium text-sm flex items-center gap-1.5 shrink-0 disabled:opacity-50"
 									type="button"
 									disabled={!!syncing || pickingDirectory}
-									on:click={async () => {
-										pickingDirectory = true;
-										try {
-											await uploadDirectoryHandler();
-										} finally {
-											pickingDirectory = false;
-										}
+									on:click={(e) => {
+										// Called BEFORE the blur: showDirectoryPicker() needs the
+										// transient activation this click carries, and it is
+										// reached synchronously from here — the first await in
+										// collectDirectoryFiles is the picker itself.
+										const target = e.currentTarget;
+										uploadDirectoryHandler();
+										// The native dialog hands focus back to the button when it
+										// closes, and with the cursor still over it the hover
+										// background stays too — so a finished upload reads as a
+										// button that is still held down.
+										target.blur();
 									}}
 								>
 									<FolderOpen className="size-4" strokeWidth="2" />
@@ -1839,6 +2033,7 @@
 												directoryId={currentDirectoryId}
 												{query}
 												uploading={uploadingItems}
+												busy={!!syncing}
 												onNavigate={(dirId) => navigateToDirectory(dirId)}
 												onRenameDirectory={(dirId, name) => renameDirectoryHandler(dirId, name)}
 												onDeleteDirectory={(dirId) => confirmDeleteDirectory(dirId)}

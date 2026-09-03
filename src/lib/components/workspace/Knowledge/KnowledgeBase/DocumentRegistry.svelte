@@ -50,12 +50,19 @@
 	/** Whether the viewer may propose a new version — anyone with write access. */
 	export let canUpload = false;
 	/**
-	 * Files the parent is currently uploading, rendered above the list with a
-	 * spinner. They have no document row yet — the registry would otherwise show
-	 * nothing at all between picking a file and the upload finishing, which read
-	 * as the app having ignored the click.
+	 * Files the SERVER reports as still processing, rendered above the list with a
+	 * spinner. Not the parent's own picks — those are announced by its progress
+	 * banner, and drawing them here too meant the same upload appeared twice.
+	 * These are the ones nothing else accounts for: an upload whose page was
+	 * reloaded, another session's, or an orphan left by a worker that died.
 	 */
 	export let uploading: any[] = [];
+	/**
+	 * The parent is uploading right now. Only suppresses the «нет содержимого»
+	 * empty state: uploading the first file into an empty folder would otherwise
+	 * render «ничего нет» directly under a banner naming the file being added.
+	 */
+	export let busy = false;
 	/**
 	 * Search text, owned by the parent's toolbar.
 	 *
@@ -520,7 +527,7 @@
 
 	{#if loading}
 		<div class="flex justify-center py-6"><Spinner className="size-5" /></div>
-	{:else if documents.length === 0 && directories.length === 0 && uploading.length === 0}
+	{:else if documents.length === 0 && directories.length === 0 && uploading.length === 0 && !busy}
 		<div class="py-6 text-center text-xs text-gray-500">{$i18n.t('No content found')}</div>
 	{:else}
 		<div class="flex flex-col w-full">

@@ -40,13 +40,18 @@
 	<!-- A labelled primary button rather than the upstream bare «+»: adding a
 	     document is the main thing anyone does on this screen, and a lone plus
 	     icon read as decoration.
-	
-	     It fires «Загрузить файлы» DIRECTLY instead of opening the dropdown. A
-	     knowledge document is one file, so the other entries — directories, sync,
-	     webpages, plain text — have no meaning in this deployment. The whole
-	     <div slot="content"> below is deliberately LEFT IN PLACE and still
-	     compiles, but `show` is never set true any more, so the menu is
-	     unreachable. To bring it back, restore `show = true` here. -->
+
+	     It fires «Загрузить файлы» DIRECTLY instead of opening the dropdown. The
+	     other entries — directories, sync, webpages, plain text — have no meaning
+	     in this deployment; the folder one has its own admin-only button in the
+	     toolbar. The whole <div slot="content"> below is deliberately LEFT IN
+	     PLACE and still compiles, but `show` is never set true any more, so the
+	     menu is unreachable. To bring it back, restore `show = true` here.
+
+	     Labelled «Загрузить файлы» rather than «Загрузить новый документ»: the
+	     input behind it is `multiple`, so the singular was a lie. The key is the
+	     one the (dead) menu entry below already uses, so no locale gains or loses
+	     a string beyond the old key being dropped. -->
 	<button
 		class="px-3 py-1.5 rounded-xl bg-black text-white dark:bg-white dark:text-black hover:opacity-90 transition font-medium text-sm flex items-center gap-1.5 shrink-0"
 		on:click={(e) => {
@@ -59,7 +64,7 @@
 				d="M8.75 3.75a.75.75 0 0 0-1.5 0v3.5h-3.5a.75.75 0 0 0 0 1.5h3.5v3.5a.75.75 0 0 0 1.5 0v-3.5h3.5a.75.75 0 0 0 0-1.5h-3.5v-3.5Z"
 			/>
 		</svg>
-		<span class="whitespace-nowrap">{$i18n.t('Upload new document')}</span>
+		<span class="whitespace-nowrap">{$i18n.t('Upload files')}</span>
 	</button>
 
 	<div slot="content">

@@ -133,6 +133,7 @@ from open_webui.models.access_grants import AccessGrants
 from open_webui.models.channels import Channels
 from open_webui.models.chats import ChatForm, Chats
 from open_webui.models.config import Config
+from open_webui.models.files import Files
 from open_webui.models.functions import Functions
 from open_webui.models.messages import Messages
 from open_webui.models.models import Models
@@ -320,6 +321,17 @@ async def lifespan(app: FastAPI):
     await seed_tier_groups()
     # After the groups: the seeded knowledge base grants access to them by id.
     await seed_knowledge_bases()
+
+    # Uploads that were still being processed when this process last stopped are
+    # dead — the work ran in-process. Left alone they say `pending` forever, which
+    # the knowledge base screen draws as a spinner for a document that will never
+    # arrive and re-polls for every five seconds. See the docstring for why this is
+    # a restart sweep and not a timeout.
+    interrupted_uploads = await Files.fail_interrupted_processing()
+    if interrupted_uploads:
+        log.warning(
+            f'Marked {len(interrupted_uploads)} interrupted upload(s) as failed: {", ".join(interrupted_uploads)}'
+        )
     await initialize_runtime_config(app)
     await migrate_legacy_webhook_config()
     await publish_event(app, EVENTS.SYSTEM_STARTUP_STARTED, source='system')
