@@ -1719,6 +1719,19 @@ async def remove_file_from_knowledge_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
+    # The same rule DELETE /{id}/document/{document_id} enforces. Without it this
+    # route asked for a write grant and then detached whatever file_id it was
+    # given, so either tier could remove anyone's published document through it —
+    # the exact thing rows 6 and 8 of the role matrix withhold. has_file() keys on
+    # a PUBLISHED file, so in practice only a reviewer now passes.
+    #
+    # Still a candidate for deletion rather than repair: it cannot reach a document
+    # awaiting its first approval, and for everything else the document route says
+    # the same thing with a better key. Nothing in the UI calls it.
+    document = await Knowledges.get_document_by_file_id(knowledge_id=id, file_id=form_data.file_id, db=db)
+    if document and not await _may_mutate_document(document, user, db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
+
     await Knowledges.remove_file_from_knowledge_by_id(knowledge_id=id, file_id=form_data.file_id, db=db)
 
     # Remove content from the vector database.
@@ -1876,9 +1889,22 @@ async def reset_knowledge_by_id(
     request: Request,
     id: str,
     include_directories: bool = Query(True),
-    user=Depends(get_verified_user),
+    user=Depends(get_admin_user),
     db: AsyncSession = Depends(get_async_session),
 ):
+    """Empty a knowledge base: every chunk, every document and (by default) every folder.
+
+    **Admin only.** It used to take a write grant, which both expert tiers hold —
+    so any Эксперт could empty the base with one request, taking documents they
+    do not own, approved revisions and the whole folder tree with it. That is
+    every restriction in rows 6 to 9 of the role matrix at once, and the route is
+    not reachable from the UI (AddContentMenu's «Сбросить» entry never opens), so
+    nothing that worked stopped working.
+
+    The write-grant test below is now unreachable — an admin satisfies it by
+    definition. Left in place as the second lock rather than deleted, so removing
+    the dependency above cannot silently reopen the route.
+    """
     knowledge = await Knowledges.get_knowledge_by_id(id=id, db=db)
     if not knowledge:
         raise HTTPException(
@@ -2057,12 +2083,18 @@ class SyncCleanupForm(BaseModel):
 async def sync_knowledge_cleanup(
     id: str,
     form_data: SyncCleanupForm,
-    user=Depends(get_verified_user),
+    user=Depends(get_admin_user),
     db: AsyncSession = Depends(get_async_session),
 ):
     """
     Remove stale files and orphaned directories from a knowledge base
     after an incremental sync.
+
+    **Admin only**, for the same reason as /reset: it deletes whatever file_ids and
+    dir_ids it is handed, without asking who owns them or whether they are
+    published, and folders go with move_files_to_parent=False. A write grant —
+    which both tiers hold — was enough. The only caller is syncDirectoryHandler,
+    reachable through a menu that never opens.
     """
     await _verify_knowledge_write_access(id, user, db)
 
