@@ -1673,7 +1673,12 @@
 							</div>
 						</div>
 
-						{#if knowledge?.write_access}
+						<!-- Admin-only: who may read the corpus is an administrator's decision
+						     (row 13), and POST /{id}/access/update now refuses anyone else. Drawn
+						     for a write-access holder before this, which meant an Эксперт could
+						     hand «Все» a public read grant — the one thing welding-kb's retrieve
+						     grant exists to prevent. -->
+						{#if $user?.role === 'admin'}
 							<div class="self-center shrink-0">
 								<button
 									class="bg-gray-50 hover:bg-gray-100 text-black dark:bg-gray-850 dark:hover:bg-gray-800 dark:text-white transition px-2 py-1 rounded-full flex gap-1 items-center"

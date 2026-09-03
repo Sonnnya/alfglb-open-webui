@@ -1182,9 +1182,23 @@ async def update_knowledge_access_by_id(
     request: Request,
     id: str,
     form_data: KnowledgeAccessGrantsForm,
-    user=Depends(get_verified_user),
+    user=Depends(get_admin_user),
     db: AsyncSession = Depends(get_async_session),
 ):
+    """Rewrite who may read and write this knowledge base. **Admin only.**
+
+    Deciding who gets at the corpus is the same right row 13 of the role matrix
+    hands to administrators alone. It used to take a write grant, which both tiers
+    hold — so an Эксперт could give «Все» a public *read* grant, and that is
+    measured, not theoretical: with one the whole document corpus becomes readable
+    and downloadable by any verified user through GET /files/{id}/content. The
+    entire point of welding-kb's public grant being RETRIEVE_PERMISSION rather
+    than 'read' is to prevent exactly that, and this route could undo it.
+
+    set_access_grants still scopes its DELETE to API_PERMISSIONS, so saving this
+    form cannot wipe the seeded retrieve grant it has no way to rebuild. That is a
+    separate guard and stays.
+    """
     knowledge = await Knowledges.get_knowledge_by_id(id=id, db=db)
     if not knowledge:
         raise HTTPException(
