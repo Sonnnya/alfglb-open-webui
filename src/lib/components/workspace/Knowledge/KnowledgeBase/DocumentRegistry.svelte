@@ -298,7 +298,14 @@
 	let confirmDeleteId: string | null = null;
 	let deleting = false;
 
-	const mayDelete = (doc: any) => canReview || doc.owner_id === $user?.id;
+	// Mirrors _may_mutate_document on the server: a reviewer may touch anything,
+	// an author only their own work and only while it is unpublished. Reading
+	// `has_published_version` and not `is_published` or `status` is load-bearing —
+	// those two describe the LATEST version, so a document with an approved v1 and
+	// a pending v2 reports pending, and keying on either would draw «Удалить» on a
+	// published document for an Эксперт the API then refuses.
+	const mayMutate = (doc: any) =>
+		canReview || (doc.owner_id === $user?.id && !doc.has_published_version);
 
 	const confirmDelete = async () => {
 		const documentId = confirmDeleteId;
@@ -555,9 +562,9 @@
 			{#each documents as doc (doc.document_id)}
 				<div
 					class="w-full border-b border-gray-50 dark:border-gray-850 py-2"
-					draggable={writeAccess}
+					draggable={writeAccess && mayMutate(doc)}
 					on:dragstart={(e) => {
-						if (!writeAccess) return;
+						if (!writeAccess || !mayMutate(doc)) return;
 						// A DOCUMENT id, not a file id — see knowledge-dnd.ts. Every drop
 						// target reads it through the same helper, so folder rows,
 						// breadcrumbs and the sidebar tree all accept this identically.
@@ -644,12 +651,12 @@
 								downloadHref={downloadHref(doc)}
 								canReview={canReview && doc.status === 'pending' && !!doc.version_id}
 								{canUpload}
-								canDelete={mayDelete(doc)}
+								canDelete={mayMutate(doc)}
 								uploading={uploadingId !== null}
 								{deleting}
 								onApprove={() => openReview(doc.version_id, 'approve')}
 								onReject={() => openReview(doc.version_id, 'reject')}
-								canMove={writeAccess}
+								canMove={writeAccess && mayMutate(doc)}
 								onUploadVersion={() => pickNewVersion(doc.document_id)}
 								onMove={() => openMove(doc)}
 								onHistory={() => toggleHistory(doc.document_id)}

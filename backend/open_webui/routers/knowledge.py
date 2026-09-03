@@ -1415,6 +1415,28 @@ async def _may_review(user, db) -> bool:
     )
 
 
+async def _may_mutate_document(document, user, db) -> bool:
+    """Whether *user* may delete or move *document*.
+
+    Three rules, in the order the role matrix states them:
+
+    * a Мастер-эксперт or an admin may touch anything, theirs or not (rows 6, 8);
+    * the author may touch their own document only while it is **unpublished** —
+      awaiting review, or rejected (row 6);
+    * once any version has been approved the document belongs to the base, and
+      only a reviewer may remove or refile it (row 8).
+
+    "Published" is ``knowledge_file.file_id`` being set, and deliberately NOT the
+    registry's ``status`` or ``is_published``. Both of those describe the *latest*
+    version: a document with an approved v1 and a pending v2 reports
+    ``status='pending'`` and ``is_published=False``, so keying the rule on either
+    would let an Эксперт delete the published revision along with their own draft.
+    """
+    if await _may_review(user, db):
+        return True
+    return document.user_id == user.id and document.file_id is None
+
+
 async def _publish_version(request, knowledge_id: str, document_id: str, file_id: str, user, db) -> None:
     """Make a version the published one: swap the vector content, then repoint the
     document. Mirrors the ordering already used by /{id}/file/update — drop the old
@@ -2526,6 +2548,8 @@ async def move_file_in_knowledge(
         document = await Knowledges.get_document_by_id(form_data.document_id, db=db)
         if not document or document.knowledge_id != id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+        if not await _may_mutate_document(document, user, db):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
         success = await Knowledges.move_document_to_directory(
             knowledge_id=id,
             document_id=form_data.document_id,
@@ -2540,6 +2564,12 @@ async def move_file_in_knowledge(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=ERROR_MESSAGES.NOT_FOUND,
             )
+        # Same rule as the document form. This branch is keyed on a *published*
+        # file_id, so in practice only a reviewer ever passes — but it is resolved
+        # and checked rather than assumed, so the two ways in cannot drift.
+        legacy_document = await Knowledges.get_document_by_file_id(knowledge_id=id, file_id=form_data.file_id, db=db)
+        if legacy_document and not await _may_mutate_document(legacy_document, user, db):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
         success = await Knowledges.move_file_to_directory(
             knowledge_id=id,
             file_id=form_data.file_id,
@@ -2918,11 +2948,13 @@ async def delete_knowledge_document(
 ):
     """Remove a document and its whole version history from the knowledge base.
 
-    Ownership follows the document, not the latest version: an Эксперт may delete
-    what they created, a Мастер-эксперт (or an admin) may delete anyone's. That
-    matters because deleting takes the history with it — letting the author of a
-    single later version delete the document would hand them everyone else's
-    revisions too.
+    Rights are `_may_mutate_document`: an Эксперт may delete what they created and
+    only while it is still unpublished, a Мастер-эксперт (or an admin) may delete
+    anyone's at any point.
+
+    Ownership follows the document, not the latest version. That matters because
+    deleting takes the history with it — letting the author of a single later
+    version delete the document would hand them everyone else's revisions too.
 
     Distinct from POST /{id}/file/remove, which is keyed on a *published* file_id
     and so cannot reach a document that has never been approved.
@@ -2935,7 +2967,7 @@ async def delete_knowledge_document(
     if not document or document.knowledge_id != id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
 
-    if document.user_id != user.id and not await _may_review(user, db):
+    if not await _may_mutate_document(document, user, db):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
 
     await _purge_document(knowledge, document_id, user, delete_files, db)
