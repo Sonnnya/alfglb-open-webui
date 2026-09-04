@@ -79,6 +79,20 @@
 	// Tags the list is currently narrowed to, owned by the parent so the filter
 	// bar and the chips agree about what is active.
 	export let activeTagIds: string[] = [];
+	/**
+	 * Whether the viewer may change which tags a document carries — a
+	 * Мастер-эксперт or an admin (row 12). Deliberately not `canUpload`, which it
+	 * used to share: an Эксперт still proposes documents and versions, they just
+	 * no longer classify them. Reading and filtering by tags stays open to
+	 * everyone who can see the registry at all.
+	 */
+	export let canTagDocuments = false;
+	/**
+	 * Whether the viewer may mint a new tag from inside the editor — admins only
+	 * (row 11). Narrower than canTagDocuments on purpose: attaching the wrong tag
+	 * is one click to undo, inventing a near-duplicate of an existing one splits
+	 * the corpus and looks correct from every row.
+	 */
 	export let canCurateTags = false;
 	export let onToggleTag: (tagId: string) => void = () => {};
 
@@ -657,7 +671,7 @@
 							<!-- Tags sit under the filename rather than beside it: a document
 							     can carry half a dozen, and squeezing them into the same line
 							     as the version badge and four controls would truncate both. -->
-							{#if doc.tags?.length || canUpload}
+							{#if doc.tags?.length || canTagDocuments}
 								<div class="flex flex-wrap items-center gap-1 mt-1">
 									{#each doc.tags ?? [] as tag (tag.id)}
 										<TagChip
@@ -667,7 +681,7 @@
 										/>
 									{/each}
 
-									{#if canUpload}
+									{#if canTagDocuments}
 										<button
 											type="button"
 											class="text-xs text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition"

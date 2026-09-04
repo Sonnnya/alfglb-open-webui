@@ -1082,14 +1082,20 @@ async def _require_knowledge_workspace(user, db) -> None:
 
 
 async def _require_tag_curator(user, db) -> None:
-    """Minting and removing vocabulary is a Мастер-эксперт / admin act.
+    """Minting and removing vocabulary is an administrator's act — row 11.
 
-    Deliberately narrower than attaching a tag, which any holder of write access
-    may do. A wrong tag on a document is one click to fix; a near-duplicate tag
-    («гост» beside «ГОСТ») silently splits the corpus in two and is exactly what
-    a controlled vocabulary exists to prevent.
+    Narrower than attaching a tag, which a Мастер-эксперт may also do (row 12),
+    and narrower than it used to be: this was `_may_review`, so a Мастер-эксперт
+    could mint too. The vocabulary is the corpus's shared index — a near-duplicate
+    tag («гост» beside «ГОСТ») silently splits it in two, and the fewer hands that
+    can create one, the longer it stays coherent. It is also the one thing here
+    that no amount of later correction fully undoes: documents filed under the
+    duplicate look correctly tagged.
+
+    Deliberately the bare admin role, not a permission key — no group grants this,
+    and inventing a key would imply a tier could be given it.
     """
-    if not await _may_review(user, db):
+    if user.role != 'admin':
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
 
 
@@ -3096,14 +3102,26 @@ async def set_knowledge_document_tags(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    """Replace a document's tag set.
+    """Replace a document's tag set. **Мастер-эксперт or admin** — row 12.
 
-    Write access to the base, not ownership of the document and not review
-    rights: tagging is cheap to correct, and an untagged corpus costs far more
-    than an occasional wrong tag. Creating new vocabulary stays gated — unknown
-    ids in the payload are ignored rather than minted.
+    This used to take plain write access, on the argument that tagging is cheap
+    to correct and an untagged corpus costs more than an occasional wrong tag.
+    The role matrix reverses that: classifying a document is part of reviewing it,
+    not part of uploading it. An Эксперт proposes the document; deciding what it
+    is about belongs with the person who decides whether it belongs at all.
+
+    Consequence worth knowing: a freshly uploaded document arrives untagged and
+    stays that way until a reviewer touches it, so tags now lag uploads. That is
+    the trade the matrix asks for.
+
+    _load_kb_for still runs first — it resolves the base and enforces access to
+    it, and _may_review answers a question about the person, not the resource.
+    Creating vocabulary is narrower still (admin); unknown ids in the payload are
+    ignored rather than minted, so this route cannot mint through the back door.
     """
     await _load_kb_for(id, user, 'write', db)
+    if not await _may_review(user, db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
 
     document = await Knowledges.get_document_by_id(document_id, db=db)
     if not document or document.knowledge_id != id:

@@ -1907,7 +1907,8 @@
 												onMoveDocument={(documentId, targetId) =>
 													moveDocumentToDirectoryHandler(documentId, targetId)}
 												{activeTagIds}
-												canCurateTags={canReviewVersions}
+												canTagDocuments={canReviewVersions}
+												canCurateTags={$user?.role === 'admin'}
 												onToggleTag={(tagId) => toggleTagFilter(tagId)}
 												onTree={(crumbs) => {
 													breadcrumbs = crumbs;
