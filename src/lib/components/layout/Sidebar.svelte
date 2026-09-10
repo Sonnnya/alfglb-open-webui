@@ -1035,14 +1035,30 @@
 					/>
 				</a>
 
-				<a href="/" class="flex flex-1 px-0.5" on:click={newChatHandler}>
-					<div
-						id="sidebar-webui-name"
-						class=" self-center font-medium text-gray-850 dark:text-white font-primary"
+				<div class="flex flex-col flex-1 px-0.5 justify-center min-w-0 leading-tight">
+					<a href="/" class="flex" on:click={newChatHandler}>
+						<div
+							id="sidebar-webui-name"
+							class=" self-center font-medium text-gray-850 dark:text-white font-primary truncate"
+						>
+							{$WEBUI_NAME}
+						</div>
+					</a>
+
+					<!-- Fork: link out to the company's own site. Sits under the product name,
+					     which goes to this app's main screen. Label is a plain Russian literal,
+					     not $i18n.t(): this deployment is Russian-only, and a t() call would add
+					     a key to all 63 locales and require `npm run i18n:parse` for CI. -->
+					<a
+						id="sidebar-company-link"
+						href="https://alfaglobal.ru"
+						target="_blank"
+						rel="noopener noreferrer"
+						class="flex text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 transition font-primary"
 					>
-						{$WEBUI_NAME}
-					</div>
-				</a>
+						<span class="self-center truncate">О компании</span>
+					</a>
+				</div>
 				<Tooltip
 					content={$showSidebar ? $i18n.t('Close Sidebar') : $i18n.t('Open Sidebar')}
 					placement="bottom"

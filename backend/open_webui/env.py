@@ -839,9 +839,10 @@ if LICENSE_PUBLIC_KEY:
 # WEBUI Identity
 ####################################
 
-WEBUI_NAME = os.getenv('WEBUI_NAME', 'Open WebUI')
-if WEBUI_NAME != 'Open WebUI':
-    WEBUI_NAME += ' (Open WebUI)'
+# Fork: the product name is «AI Сварка» (per the Техническое задание). Upstream
+# appends ' (Open WebUI)' to any custom name; that suffix is dropped here under the
+# LICENSE clause 4 exemption for deployments under 50 end users in a rolling 30 days.
+WEBUI_NAME = os.getenv('WEBUI_NAME', 'AI Сварка')
 
 WEBUI_FAVICON_URL = 'https://openwebui.com/favicon.png'
 WEBUI_BUILD_HASH = os.getenv('WEBUI_BUILD_HASH', 'dev-build')

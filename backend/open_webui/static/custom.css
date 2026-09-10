@@ -1,0 +1,133 @@
+/* ---------------------------------------------------------------------------
+ * ALFA GLOBAL brand tokens
+ *
+ * PALETTE ANCHOR: alfaglobal.ru — the live site is the primary source.
+ * Its own CSS custom properties are used verbatim where they exist:
+ *   --main-bg-color      #601327  -> --ag-maroon-700 / --brand-primary
+ *   --main-bghover-color #4b0f1e  -> --ag-maroon-800 / --brand-primary-hover
+ *   --main-slon-color    #e4c98c  -> --ag-beige-500
+ *   --main-slon-hover... #f8eacf  -> --ag-beige-100
+ *   --main-seller-color  #0d3883  -> --ag-seller  (Seller product line only)
+ * The intermediate ramp steps are interpolated from the site hue (344.4deg)
+ * and saturation (67%); token NAMES follow the Claude Design project
+ * "Alfa Global Design System" so both vocabularies line up.
+ *
+ * Loaded by src/app.html BEFORE %sveltekit.head%, so the app's own stylesheet
+ * still wins on any collision. Everything here is additive vocabulary.
+ *
+ * NOTHING NEW IS INSTALLED: no webfont import, no dependency. Inter is already
+ * self-hosted at /assets/fonts/Inter-Variable.ttf and is the app's existing face.
+ *
+ * DELIBERATELY OMITTED:
+ *   - the --color-gray-* ramp: byte-identical to src/tailwind.css @theme
+ *     (verified), so copying it only risks pinning stale values on a sync.
+ *     Tailwind v4 compiles that block to :root,:host, so the var() references
+ *     below resolve correctly.
+ *   - --font-sans / --font-mono: the app's stack is
+ *     -apple-system, BlinkMacSystemFont, 'Inter', 'Vazirmatn', ...
+ *     Overriding it would drop Vazirmatn and break Arabic/Persian rendering.
+ * ------------------------------------------------------------------------- */
+
+:root {
+	/* Brand ramp — anchored on the site's own two maroons */
+	--ag-maroon-900: #260810;
+	--ag-maroon-800: #4b0f1e; /* site --main-bghover-color */
+	--ag-maroon-700: #601327; /* site --main-bg-color  — PRIMARY */
+	--ag-maroon-600: #771830;
+	--ag-maroon-500: #991e3e;
+	--ag-maroon-400: #b8496a;
+	--ag-maroon-300: #d4859c;
+	--ag-maroon-200: #e9b9c6;
+	--ag-maroon-100: #f5e5e9;
+	--ag-maroon-50: #fbf4f6;
+
+	--ag-black: #0a0a0a;
+	--ag-white: #ffffff;
+
+	/* Accent — beige. NOT a second brand hue; fills and highlights only. */
+	--ag-beige-500: #e4c98c; /* site --main-slon-color */
+	--ag-beige-600: #cdad63;
+	--ag-beige-100: #f8eacf; /* site --main-slon-hover-color */
+
+	/* Seller product line only — never general UI */
+	--ag-seller: #0d3883; /* site --main-seller-color */
+
+	/* Semantic — brand. Hover goes DARKER, following the site. */
+	--brand-primary: var(--ag-maroon-700);
+	--brand-primary-hover: var(--ag-maroon-800);
+	--brand-primary-active: var(--ag-maroon-900);
+	--brand-on-primary: var(--ag-white);
+
+	/* Semantic — surfaces */
+	--surface-page: var(--ag-white);
+	--surface-sidebar: var(--color-gray-50);
+	--surface-card: var(--ag-white);
+	--surface-raised: var(--ag-white);
+	--surface-sunken: var(--color-gray-100);
+	--surface-inverse: var(--ag-black);
+
+	/* Semantic — borders (hairlines stay gray; maroon is for fills) */
+	--border-subtle: var(--color-gray-200);
+	--border-default: var(--color-gray-300);
+	--border-strong: var(--color-gray-400);
+
+	/* Semantic — text */
+	--text-primary: var(--ag-black);
+	--text-secondary: var(--color-gray-600);
+	--text-tertiary: var(--color-gray-500);
+	--text-on-brand: var(--ag-white);
+	--text-link: var(--ag-maroon-700);
+	--text-link-hover: var(--ag-maroon-600);
+
+	/* Feedback */
+	--accent-success: #1f7a4d;
+	--accent-danger: #b3261e;
+	--accent-warning: #a9660a;
+	--accent-info: #2563a8;
+	--accent-beige: var(--ag-beige-500);
+	--accent-beige-hover: var(--ag-beige-600);
+
+	/* Dark mode surfaces */
+	--dark-surface-page: var(--color-gray-950);
+	--dark-surface-sidebar: var(--color-gray-900);
+	--dark-surface-card: var(--color-gray-850);
+	--dark-border-default: var(--color-gray-800);
+	--dark-text-primary: var(--color-gray-50);
+	--dark-text-secondary: var(--color-gray-400);
+
+	/* Type scale (additive — font stack intentionally not overridden) */
+	--text-xs: 12px;
+	--text-sm: 13px;
+	--text-base: 15px;
+	--text-md: 16px;
+	--text-lg: 18px;
+	--text-xl: 22px;
+	--text-2xl: 28px;
+	--text-3xl: 36px;
+	--leading-tight: 1.2;
+	--leading-normal: 1.5;
+	--leading-relaxed: 1.7;
+	--weight-regular: 400;
+	--weight-medium: 500;
+	--weight-semibold: 600;
+	--weight-bold: 700;
+
+	/* Spacing, radius, shadow */
+	--space-1: 4px;
+	--space-2: 8px;
+	--space-3: 12px;
+	--space-4: 16px;
+	--space-5: 20px;
+	--space-6: 24px;
+	--space-8: 32px;
+	--space-10: 40px;
+	--space-12: 48px;
+	--space-16: 64px;
+	--radius-sm: 6px;
+	--radius-md: 10px;
+	--radius-lg: 14px;
+	--radius-full: 999px;
+	--shadow-sm: 0 1px 2px rgba(10, 10, 10, 0.06);
+	--shadow-md: 0 4px 12px rgba(10, 10, 10, 0.08);
+	--shadow-lg: 0 12px 32px rgba(10, 10, 10, 0.12);
+}

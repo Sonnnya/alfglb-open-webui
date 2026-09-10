@@ -2448,10 +2448,13 @@ async def get_manifest_json():
         return {
             'name': app.state.WEBUI_NAME,
             'short_name': app.state.WEBUI_NAME,
-            'description': f'{app.state.WEBUI_NAME} is an open, extensible, user-friendly interface for AI that adapts to your workflow.',
+            'description': f'{app.state.WEBUI_NAME} — ИИ-ассистент по сварочным материалам и технологиям.',
             'start_url': '/',
             'display': 'standalone',
-            'background_color': '#343541',
+            # Brand maroon (alfaglobal.ru --main-bg-color). Was '#343541', ChatGPT grey.
+            # This is the PWA install splash, so it sits behind the white-on-maroon
+            # maskable icons in static/web-app-manifest-*.png.
+            'background_color': '#601327',
             'icons': [
                 {
                     'src': '/static/logo.png',
