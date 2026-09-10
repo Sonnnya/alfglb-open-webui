@@ -121,7 +121,13 @@
 				<span class=" capitalize">{$config?.license_metadata?.type}</span> license purchased by
 				<span class=" capitalize">{$config?.license_metadata?.organization_name}</span>
 			</div>
-		{:else}
+		{:else if false}
+			<!-- Fork: Discord / X / GitHub promo badges hidden. This panel is reachable by
+			     every user, and these invite them to Open WebUI's own social channels; the
+			     three <img> tags also fetch from img.shields.io on each render, which is an
+			     outbound request from an internal tool. Kept, not deleted — drop the
+			     `if false` to restore. The copyright notice below stays: LICENSE clauses 1
+			     and 2 require retaining it. -->
 			<div class="flex space-x-1">
 				<a href="https://discord.gg/5rJgQTnV4s" target="_blank">
 					<img
