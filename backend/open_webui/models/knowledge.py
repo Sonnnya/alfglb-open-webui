@@ -347,6 +347,13 @@ class KnowledgeDocumentResponse(BaseModel):
     owner_id: str
     # True when this exact version is the one the model can retrieve.
     is_published: bool = False
+    # True when the DOCUMENT has a published version — any version, not this one.
+    # Deliberately separate from is_published above: with an approved v1 and a
+    # pending v2 the row describes v2, so is_published is False while the document
+    # is very much published. Delete and move rights turn on THIS field (an
+    # Эксперт may remove their own work only before it is approved), so a client
+    # asking the other one would offer buttons the API then refuses.
+    has_published_version: bool = False
     created_at: int
     updated_at: int
 
@@ -1171,6 +1178,7 @@ class KnowledgeTable:
                         author=(UserResponse(**UserModel.model_validate(author).model_dump()) if author else None),
                         owner_id=document.user_id,
                         is_published=bool(document.file_id) and document.file_id == (ver.file_id if ver else file.id),
+                        has_published_version=bool(document.file_id),
                         created_at=ver.created_at if ver else document.created_at,
                         updated_at=document.updated_at,
                     )

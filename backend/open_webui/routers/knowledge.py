@@ -1277,9 +1277,23 @@ async def update_knowledge_access_by_id(
     request: Request,
     id: str,
     form_data: KnowledgeAccessGrantsForm,
-    user=Depends(get_verified_user),
+    user=Depends(get_admin_user),
     db: AsyncSession = Depends(get_async_session),
 ):
+    """Rewrite who may read and write this knowledge base. **Admin only.**
+
+    Deciding who gets at the corpus is the same right row 13 of the role matrix
+    hands to administrators alone. It used to take a write grant, which both tiers
+    hold — so an Эксперт could give «Все» a public *read* grant, and that is
+    measured, not theoretical: with one the whole document corpus becomes readable
+    and downloadable by any verified user through GET /files/{id}/content. The
+    entire point of welding-kb's public grant being RETRIEVE_PERMISSION rather
+    than 'read' is to prevent exactly that, and this route could undo it.
+
+    set_access_grants still scopes its DELETE to API_PERMISSIONS, so saving this
+    form cannot wipe the seeded retrieve grant it has no way to rebuild. That is a
+    separate guard and stays.
+    """
     knowledge = await Knowledges.get_knowledge_by_id(id=id, db=db)
     if not knowledge:
         raise HTTPException(
@@ -1508,6 +1522,28 @@ async def _may_review(user, db) -> bool:
     return user.role == 'admin' or await has_permission(
         user.id, 'workspace.knowledge_review', await Config.get('user.permissions'), db=db
     )
+
+
+async def _may_mutate_document(document, user, db) -> bool:
+    """Whether *user* may delete or move *document*.
+
+    Three rules, in the order the role matrix states them:
+
+    * a Мастер-эксперт or an admin may touch anything, theirs or not (rows 6, 8);
+    * the author may touch their own document only while it is **unpublished** —
+      awaiting review, or rejected (row 6);
+    * once any version has been approved the document belongs to the base, and
+      only a reviewer may remove or refile it (row 8).
+
+    "Published" is ``knowledge_file.file_id`` being set, and deliberately NOT the
+    registry's ``status`` or ``is_published``. Both of those describe the *latest*
+    version: a document with an approved v1 and a pending v2 reports
+    ``status='pending'`` and ``is_published=False``, so keying the rule on either
+    would let an Эксперт delete the published revision along with their own draft.
+    """
+    if await _may_review(user, db):
+        return True
+    return document.user_id == user.id and document.file_id is None
 
 
 async def _publish_version(request, knowledge_id: str, document_id: str, file_id: str, user, db) -> None:
@@ -1792,6 +1828,19 @@ async def remove_file_from_knowledge_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
+    # The same rule DELETE /{id}/document/{document_id} enforces. Without it this
+    # route asked for a write grant and then detached whatever file_id it was
+    # given, so either tier could remove anyone's published document through it —
+    # the exact thing rows 6 and 8 of the role matrix withhold. has_file() keys on
+    # a PUBLISHED file, so in practice only a reviewer now passes.
+    #
+    # Still a candidate for deletion rather than repair: it cannot reach a document
+    # awaiting its first approval, and for everything else the document route says
+    # the same thing with a better key. Nothing in the UI calls it.
+    document = await Knowledges.get_document_by_file_id(knowledge_id=id, file_id=form_data.file_id, db=db)
+    if document and not await _may_mutate_document(document, user, db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
+
     await Knowledges.remove_file_from_knowledge_by_id(knowledge_id=id, file_id=form_data.file_id, db=db)
 
     # Remove content from the vector database.
@@ -1949,9 +1998,22 @@ async def reset_knowledge_by_id(
     request: Request,
     id: str,
     include_directories: bool = Query(True),
-    user=Depends(get_verified_user),
+    user=Depends(get_admin_user),
     db: AsyncSession = Depends(get_async_session),
 ):
+    """Empty a knowledge base: every chunk, every document and (by default) every folder.
+
+    **Admin only.** It used to take a write grant, which both expert tiers hold —
+    so any Эксперт could empty the base with one request, taking documents they
+    do not own, approved revisions and the whole folder tree with it. That is
+    every restriction in rows 6 to 9 of the role matrix at once, and the route is
+    not reachable from the UI (AddContentMenu's «Сбросить» entry never opens), so
+    nothing that worked stopped working.
+
+    The write-grant test below is now unreachable — an admin satisfies it by
+    definition. Left in place as the second lock rather than deleted, so removing
+    the dependency above cannot silently reopen the route.
+    """
     knowledge = await Knowledges.get_knowledge_by_id(id=id, db=db)
     if not knowledge:
         raise HTTPException(
@@ -2130,12 +2192,18 @@ class SyncCleanupForm(BaseModel):
 async def sync_knowledge_cleanup(
     id: str,
     form_data: SyncCleanupForm,
-    user=Depends(get_verified_user),
+    user=Depends(get_admin_user),
     db: AsyncSession = Depends(get_async_session),
 ):
     """
     Remove stale files and orphaned directories from a knowledge base
     after an incremental sync.
+
+    **Admin only**, for the same reason as /reset: it deletes whatever file_ids and
+    dir_ids it is handed, without asking who owns them or whether they are
+    published, and folders go with move_files_to_parent=False. A write grant —
+    which both tiers hold — was enough. The only caller is syncDirectoryHandler,
+    reachable through a menu that never opens.
     """
     await _verify_knowledge_write_access(id, user, db)
 
@@ -2450,9 +2518,20 @@ async def create_knowledge_directory(
     request: Request,
     id: str,
     form_data: KnowledgeDirectoryCreateForm,
-    user=Depends(get_verified_user),
+    user=Depends(get_admin_user),
     db: AsyncSession = Depends(get_async_session),
 ):
+    """Create a folder. **Admin only** — row 7 of the role matrix.
+
+    Creating, renaming, moving and deleting folders are one right, held by nobody
+    but an administrator: the tree is the shape of the corpus, and an Эксперт
+    reorganising it moves everyone else's documents without touching them.
+    Reading the tree is a different question — GET /{id}/dirs stays on
+    _load_kb_for, because both tiers have to see where their documents live.
+
+    The write-grant test below is now unreachable, as an admin satisfies it by
+    definition; kept as the second lock, same as /reset.
+    """
     await _verify_knowledge_write_access(id, user, db)
 
     directory = await Knowledges.create_directory(
@@ -2483,9 +2562,14 @@ async def update_knowledge_directory(
     id: str,
     dir_id: str,
     form_data: KnowledgeDirectoryUpdateForm,
-    user=Depends(get_verified_user),
+    user=Depends(get_admin_user),
     db: AsyncSession = Depends(get_async_session),
 ):
+    """Rename a folder, move it, or both. **Admin only** — see /dirs/create.
+
+    One route for two operations: the form carries `name` and `parent_id`, so
+    dragging a folder somewhere else comes through here too.
+    """
     await _verify_knowledge_write_access(id, user, db)
 
     # Verify directory belongs to this knowledge base
@@ -2523,9 +2607,16 @@ async def delete_knowledge_directory(
     id: str,
     dir_id: str,
     move_files: bool = Query(True, description='If true, move contained files to parent. If false, delete them.'),
-    user=Depends(get_verified_user),
+    user=Depends(get_admin_user),
     db: AsyncSession = Depends(get_async_session),
 ):
+    """Delete a folder, optionally with everything under it. **Admin only** — see /dirs/create.
+
+    The per-document ownership pass below is now redundant for the same reason the
+    write-grant test is: only an admin reaches it, and an admin may purge anyone's
+    work. It stays because it is the thing that makes a mixed-ownership subtree
+    delete all-or-nothing, and that property should not depend on who is asking.
+    """
     knowledge = await _verify_knowledge_write_access(id, user, db)
 
     # Verify directory belongs to this knowledge base
@@ -2621,6 +2712,8 @@ async def move_file_in_knowledge(
         document = await Knowledges.get_document_by_id(form_data.document_id, db=db)
         if not document or document.knowledge_id != id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+        if not await _may_mutate_document(document, user, db):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
         success = await Knowledges.move_document_to_directory(
             knowledge_id=id,
             document_id=form_data.document_id,
@@ -2635,6 +2728,12 @@ async def move_file_in_knowledge(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=ERROR_MESSAGES.NOT_FOUND,
             )
+        # Same rule as the document form. This branch is keyed on a *published*
+        # file_id, so in practice only a reviewer ever passes — but it is resolved
+        # and checked rather than assumed, so the two ways in cannot drift.
+        legacy_document = await Knowledges.get_document_by_file_id(knowledge_id=id, file_id=form_data.file_id, db=db)
+        if legacy_document and not await _may_mutate_document(legacy_document, user, db):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
         success = await Knowledges.move_file_to_directory(
             knowledge_id=id,
             file_id=form_data.file_id,
@@ -3013,11 +3112,13 @@ async def delete_knowledge_document(
 ):
     """Remove a document and its whole version history from the knowledge base.
 
-    Ownership follows the document, not the latest version: an Эксперт may delete
-    what they created, a Мастер-эксперт (or an admin) may delete anyone's. That
-    matters because deleting takes the history with it — letting the author of a
-    single later version delete the document would hand them everyone else's
-    revisions too.
+    Rights are `_may_mutate_document`: an Эксперт may delete what they created and
+    only while it is still unpublished, a Мастер-эксперт (or an admin) may delete
+    anyone's at any point.
+
+    Ownership follows the document, not the latest version. That matters because
+    deleting takes the history with it — letting the author of a single later
+    version delete the document would hand them everyone else's revisions too.
 
     Distinct from POST /{id}/file/remove, which is keyed on a *published* file_id
     and so cannot reach a document that has never been approved.
@@ -3030,7 +3131,7 @@ async def delete_knowledge_document(
     if not document or document.knowledge_id != id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
 
-    if document.user_id != user.id and not await _may_review(user, db):
+    if not await _may_mutate_document(document, user, db):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
 
     await _purge_document(knowledge, document_id, user, delete_files, db)

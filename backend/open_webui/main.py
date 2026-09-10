@@ -86,18 +86,18 @@ from open_webui.env import (
     ENABLE_COMPRESSION_MIDDLEWARE,
     ENABLE_CUSTOM_MODEL_FALLBACK,
     ENABLE_EASTER_EGGS,
-    EXTERNAL_PWA_MANIFEST_URL,
     # OAuth Back-Channel Logout
     ENABLE_OAUTH_BACKCHANNEL_LOGOUT,
     ENABLE_OTEL,
     ENABLE_PUBLIC_ACTIVE_USERS_COUNT,
+    ENABLE_PYODIDE_FILE_PERSISTENCE,
     # SCIM
     ENABLE_SCIM,
     ENABLE_SIGNUP_PASSWORD_CONFIRMATION,
     ENABLE_STAR_SESSIONS_MIDDLEWARE,
-    ENABLE_PYODIDE_FILE_PERSISTENCE,
     ENABLE_VERSION_UPDATE_CHECK,
     ENABLE_WEBSOCKET_SUPPORT,
+    EXTERNAL_PWA_MANIFEST_URL,
     GLOBAL_LOG_LEVEL,
     INSTANCE_ID,
     LICENSE_KEY,
@@ -123,17 +123,20 @@ from open_webui.env import (
 from open_webui.events import (
     EVENTS,
     delete_event_webhook,
-    get_event_catalog as get_event_catalog_items,
     get_event_webhooks,
     migrate_legacy_webhook_config,
     publish_event,
     upsert_event_webhook,
+)
+from open_webui.events import (
+    get_event_catalog as get_event_catalog_items,
 )
 from open_webui.internal.db import engine, get_async_session
 from open_webui.models.access_grants import AccessGrants
 from open_webui.models.channels import Channels
 from open_webui.models.chats import ChatForm, Chats
 from open_webui.models.config import Config
+from open_webui.models.files import Files
 from open_webui.models.functions import Functions
 from open_webui.models.messages import Messages
 from open_webui.models.models import Models
@@ -322,6 +325,17 @@ async def lifespan(app: FastAPI):
     # After the groups: the seeded knowledge base grants access to them by id.
     await seed_knowledge_bases()
     await seed_knowledge_tags()
+
+    # Uploads that were still being processed when this process last stopped are
+    # dead — the work ran in-process. Left alone they say `pending` forever, which
+    # the knowledge base screen draws as a spinner for a document that will never
+    # arrive and re-polls for every five seconds. See the docstring for why this is
+    # a restart sweep and not a timeout.
+    interrupted_uploads = await Files.fail_interrupted_processing()
+    if interrupted_uploads:
+        log.warning(
+            f'Marked {len(interrupted_uploads)} interrupted upload(s) as failed: {", ".join(interrupted_uploads)}'
+        )
     await initialize_runtime_config(app)
     await migrate_legacy_webhook_config()
     await publish_event(app, EVENTS.SYSTEM_STARTUP_STARTED, source='system')
@@ -2173,7 +2187,7 @@ async def get_app_version():
 @app.get('/api/version/updates')
 async def get_app_latest_release_version(user=Depends(get_verified_user)):
     if not ENABLE_VERSION_UPDATE_CHECK:
-        log.debug(f'Version update check is disabled, returning current version as latest version')
+        log.debug('Version update check is disabled, returning current version as latest version')
         return {'current': VERSION, 'latest': VERSION}
     try:
         timeout = aiohttp.ClientTimeout(total=1)
@@ -2243,7 +2257,7 @@ try:
         log.info('Using Redis for session')
     else:
         raise ValueError('No Redis URL provided')
-except Exception as e:
+except Exception:
     app.add_middleware(
         SessionMiddleware,
         secret_key=WEBUI_SECRET_KEY,

@@ -405,6 +405,56 @@ class FilesTable:
             except Exception:
                 return None
 
+    async def fail_interrupted_processing(self, db: AsyncSession | None = None) -> list[str]:
+        """Mark uploads whose processing never finished as failed. Returns their ids.
+
+        ``process_uploaded_file`` runs as an in-process background task, so a worker
+        that stops — a crash, a redeploy, a debugger killed halfway through an OCR
+        run — takes every job it was holding with it and leaves the file row saying
+        ``pending`` forever.  Nothing else ever revisits that row, and until it is
+        resolved ``get_pending_files_for_knowledge`` keeps reporting it, so the
+        knowledge base screen shows a spinner for a document that will never arrive
+        and re-polls for it every five seconds in every open tab.
+
+        There is deliberately no *timeout*: a scanned PDF can hold the OCR loop for
+        well over an hour, so any threshold short enough to clear a ghost promptly is
+        short enough to kill a legitimate run.  A restart is the stronger signal —
+        the process that owned the row is provably gone.
+
+        Called once from ``lifespan``, unconditionally.  With ``UVICORN_WORKERS > 1``
+        a booting worker can catch a sibling's live job; that is not damage, because
+        the sibling writes the terminal status itself when it finishes.  It does
+        leave this ``error`` behind on the row it completes — ``update_file_data_by_id``
+        merges rather than replaces — which nothing renders.
+        """
+        async with get_async_db_context(db) as db:
+            try:
+                result = await db.execute(
+                    select(File).filter(File.data['status'].as_string().in_(['pending', 'processing']))
+                )
+                files = result.scalars().all()
+                if not files:
+                    return []
+
+                now = int(time.time())
+                ids = []
+                for file in files:
+                    # Reassigned rather than mutated in place: SQLAlchemy does not
+                    # track edits inside a JSON column's dict.
+                    file.data = {
+                        **(file.data or {}),
+                        'status': 'failed',
+                        'error': 'Processing was interrupted before it finished.',
+                    }
+                    file.updated_at = now
+                    ids.append(file.id)
+
+                await db.commit()
+                return ids
+            except Exception as e:
+                log.warning(f'Error failing interrupted file processing: {e}')
+                return []
+
     async def get_pending_files_for_knowledge(
         self, knowledge_id: str, db: AsyncSession | None = None
     ) -> list[FileModelResponse]:

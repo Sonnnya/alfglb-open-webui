@@ -53,12 +53,19 @@
 	/** Whether the viewer may propose a new version — anyone with write access. */
 	export let canUpload = false;
 	/**
-	 * Files the parent is currently uploading, rendered above the list with a
-	 * spinner. They have no document row yet — the registry would otherwise show
-	 * nothing at all between picking a file and the upload finishing, which read
-	 * as the app having ignored the click.
+	 * Files the SERVER reports as still processing, rendered above the list with a
+	 * spinner. Not the parent's own picks — those are announced by its progress
+	 * banner, and drawing them here too meant the same upload appeared twice.
+	 * These are the ones nothing else accounts for: an upload whose page was
+	 * reloaded, another session's, or an orphan left by a worker that died.
 	 */
 	export let uploading: any[] = [];
+	/**
+	 * The parent is uploading right now. Only suppresses the «нет содержимого»
+	 * empty state: uploading the first file into an empty folder would otherwise
+	 * render «ничего нет» directly under a banner naming the file being added.
+	 */
+	export let busy = false;
 	/**
 	 * Search text, owned by the parent's toolbar.
 	 *
@@ -101,6 +108,14 @@
 	let editingTagsFor: string | null = null;
 	/** Whether the viewer may create, rename, move or delete folders. */
 	export let writeAccess = false;
+	/**
+	 * Whether the viewer may change the folder tree — create, rename, move,
+	 * delete. Administrators only, and deliberately a second prop rather than a
+	 * rename of `writeAccess`: an Эксперт keeps every document right that one
+	 * carries (upload, drag a document into a folder, move their own), and only
+	 * loses the folders themselves.
+	 */
+	export let manageFolders = false;
 
 	export let onNavigate: (directoryId: string | null) => void = () => {};
 	export let onRenameDirectory: (directoryId: string, name: string) => void = () => {};
@@ -337,7 +352,14 @@
 	let confirmDeleteId: string | null = null;
 	let deleting = false;
 
-	const mayDelete = (doc: any) => canReview || doc.owner_id === $user?.id;
+	// Mirrors _may_mutate_document on the server: a reviewer may touch anything,
+	// an author only their own work and only while it is unpublished. Reading
+	// `has_published_version` and not `is_published` or `status` is load-bearing —
+	// those two describe the LATEST version, so a document with an approved v1 and
+	// a pending v2 reports pending, and keying on either would draw «Удалить» on a
+	// published document for an Эксперт the API then refuses.
+	const mayMutate = (doc: any) =>
+		canReview || (doc.owner_id === $user?.id && !doc.has_published_version);
 
 	const confirmDelete = async () => {
 		const documentId = confirmDeleteId;
@@ -585,7 +607,7 @@
 
 	{#if loading}
 		<div class="flex justify-center py-6"><Spinner className="size-5" /></div>
-	{:else if documents.length === 0 && directories.length === 0 && uploading.length === 0}
+	{:else if documents.length === 0 && directories.length === 0 && uploading.length === 0 && !busy}
 		<div class="py-6 text-center text-xs text-gray-500">{$i18n.t('No content found')}</div>
 	{:else}
 		<div class="flex flex-col w-full">
@@ -599,7 +621,7 @@
 				<div class="w-full border-b border-gray-50 dark:border-gray-850 py-2">
 					<DirectoryRow
 						{directory}
-						{writeAccess}
+						{manageFolders}
 						scopedToViewer={!canReview}
 						onNavigate={(dirId) => onNavigate(dirId)}
 						onRename={(dirId, name) => onRenameDirectory(dirId, name)}
@@ -613,9 +635,9 @@
 			{#each documents as doc (doc.document_id)}
 				<div
 					class="w-full border-b border-gray-50 dark:border-gray-850 py-2"
-					draggable={writeAccess}
+					draggable={writeAccess && mayMutate(doc)}
 					on:dragstart={(e) => {
-						if (!writeAccess) return;
+						if (!writeAccess || !mayMutate(doc)) return;
 						// A DOCUMENT id, not a file id — see knowledge-dnd.ts. Every drop
 						// target reads it through the same helper, so folder rows,
 						// breadcrumbs and the sidebar tree all accept this identically.
@@ -729,12 +751,12 @@
 								downloadHref={downloadHref(doc)}
 								canReview={canReview && doc.status === 'pending' && !!doc.version_id}
 								{canUpload}
-								canDelete={mayDelete(doc)}
+								canDelete={mayMutate(doc)}
 								uploading={uploadingId !== null}
 								{deleting}
 								onApprove={() => openReview(doc.version_id, 'approve')}
 								onReject={() => openReview(doc.version_id, 'reject')}
-								canMove={writeAccess}
+								canMove={writeAccess && mayMutate(doc)}
 								onUploadVersion={() => pickNewVersion(doc.document_id)}
 								onMove={() => openMove(doc)}
 								onHistory={() => toggleHistory(doc.document_id)}
